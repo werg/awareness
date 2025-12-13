@@ -1,6 +1,5 @@
 """Tests for configuration module."""
 
-import pytest
 from awareness.config import Config, EncoderConfig, DecoderConfig
 
 
@@ -8,28 +7,16 @@ def test_config_creation():
     """Test that Config can be created with defaults."""
     config = Config()
     assert config is not None
-    assert config.device in ["cuda", "cpu"]
+    assert config.device == "cuda"
 
 
 def test_encoder_config():
-    """Test EncoderConfig."""
+    """Test EncoderConfig can be instantiated."""
     config = EncoderConfig()
-    assert config.hidden_size == 1024
-    assert config.num_attention_heads == 16
+    assert config.model_name is None  # No default - to be chosen
 
 
 def test_decoder_config():
-    """Test DecoderConfig."""
+    """Test DecoderConfig can be instantiated."""
     config = DecoderConfig()
-    assert config.gca_enabled is True
-    assert config.gca_start_layer == 18
-
-
-def test_config_to_dict():
-    """Test config serialization to dict."""
-    config = Config()
-    config_dict = config.to_dict()
-    assert isinstance(config_dict, dict)
-    assert "encoder" in config_dict
-    assert "decoder" in config_dict
-    assert "training" in config_dict
+    assert config.model_name is None  # No default - to be chosen

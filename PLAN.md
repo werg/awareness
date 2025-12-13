@@ -53,12 +53,15 @@ The **Student** (Awareness Model) must replicate the outputs of a **Teacher** (L
 ### 3.2 The Loss Landscape
 1.  **KL Divergence / Cross-Entropy:** The Student must match the Teacher's token distribution.
 2.  **Sparsity Regularization (Optional):** Penalize the encoder for producing redundant KV pairs, encouraging semantic compression.
-3.  **Auxiliary Task - Citation:** The Student is trained to predict *which* document $d_i$ contributed to the answer, enforcing grounding and reducing hallucination.
 
-### 3.3 Training Curriculum
-1.  **Phase I: Repository Reconstruction:** Masked code completion where the "mask" requires information from a different file in the repo.
-2.  **Phase II: Instruction Following:** Multi-hop reasoning tasks ("Refactor class X based on the interface defined in file Y").
-3.  **Phase III: State Tracking:** Tasks involving mutable variables across a user session, requiring the model to read/write to memory conceptually.
+### 3.3 Staged joint Encoder - Decoder training
+
+For the encoder training phase we do not need the latent memory store as a condensed entity (with just the encoder outputs). Instead, we:
+
+- Train encoder and decoder jointly (initially freezing / slowing the base decoder network)
+- Train in stages of subsequent agentic code transformations within one repository, for example a sequence of git commits, or a sequence of follow up agentic tasks.
+- Use the fact that many encoded files stay stable across transformation steps.
+- Only recompute encoder passes on changed files between stages.
 
 ---
 
@@ -92,10 +95,6 @@ Current coding assistants rely on RAG (imprecise) or stuffing context (expensive
     *   Take existing commits and reverse-encode them as tasks prompts using an LLM.
     *   Distill larger Qwen3 model teacher creating the commits.
 3.  **Negative Sampling:** Training the model *not* to attend to irrelevant files (anti-hallucination).
-
-### 5.3 Evaluation Metrics
-*   **Perplexity (PPL) on Remote Context:** Can the model predict code in File A that depends on a definition in File B?
-*   **Needle-in-a-Haystack (Repo Edition):** Retrieval accuracy of specific function definitions amidst 100k lines of code.
 
 ---
 

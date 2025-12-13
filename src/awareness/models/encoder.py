@@ -1,113 +1,66 @@
-"""Context Encoder: Bidirectional transformer for encoding documents into KV tensors."""
+"""Context Encoder (E_θ): Maps documents to latent KV representations.
 
-from typing import Dict, Optional, Tuple, Any
+From PLAN.md Section 2.1:
+- A lightweight, bidirectional Transformer optimized for representation, not generation
+- Input: Discrete document chunks (files, diffs, wiki articles)
+- Output: Compressed sequence of KV tensors, distinct from decoder's internal states
+- Operational invariant: E_θ is run asynchronously. When document d_i is modified,
+  only E_θ(d_i) is re-computed. The global context is never fully re-processed.
+"""
+
+from typing import Tuple
 import torch
 import torch.nn as nn
-from transformers import AutoModel, AutoConfig
-from awareness.models.base import AwarenessModel
-from awareness.config import EncoderConfig
 
 
-class ContextEncoder(AwarenessModel):
+class ContextEncoder(nn.Module):
     """
     The Context Encoder (E_θ).
 
-    Maps raw document chunks to latent Key/Value (KV) tensor pairs.
-    Operates asynchronously: only modified documents are re-encoded.
+    Maps raw tokens X to latent memory representations (K_mem, V_mem).
+    Unlike standard embeddings, these are explicitly shaped to be consumed
+    by attention heads in the decoder.
+
+    The specific model architecture (e.g., Qwen3 embedding model) should be
+    chosen based on experimentation. This class defines the interface.
     """
 
-    def __init__(self, config: EncoderConfig):
+    def __init__(self, hidden_size: int):
         """
-        Initialize the Context Encoder.
+        Initialize the encoder.
 
         Args:
-            config: EncoderConfig instance with model configuration
+            hidden_size: Dimension of the KV representations
         """
         super().__init__()
-        self.config = config
-
-        # Load the base transformer model
-        model_config = AutoConfig.from_pretrained(config.model_name)
-        self.transformer = AutoModel.from_pretrained(
-            config.model_name,
-            config=model_config,
-            load_in_8bit=False,
-        )
-
-        # Projection layers for explicit KV tensor generation
-        hidden_size = model_config.hidden_size
-        self.key_projection = nn.Linear(hidden_size, hidden_size)
-        self.value_projection = nn.Linear(hidden_size, hidden_size)
-
-        if config.gradient_checkpointing:
-            self.transformer.gradient_checkpointing_enable()
+        self.hidden_size = hidden_size
+        # Actual transformer backbone TBD based on model selection
 
     def forward(
         self,
         input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        token_type_ids: Optional[torch.Tensor] = None,
+        attention_mask: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Encode documents into KV tensor pairs.
 
         Args:
-            input_ids: Token IDs of shape [batch_size, seq_length]
-            attention_mask: Attention mask of shape [batch_size, seq_length]
-            token_type_ids: Token type IDs for segment encoding
+            input_ids: Token IDs [batch_size, seq_length]
+            attention_mask: Attention mask [batch_size, seq_length]
 
         Returns:
-            Tuple of (K_mem, V_mem) tensors:
-            - K_mem: Key tensor of shape [batch_size, seq_length, hidden_size]
-            - V_mem: Value tensor of shape [batch_size, seq_length, hidden_size]
+            Tuple of (K_mem, V_mem):
+            - K_mem: Key tensor [batch_size, seq_length, hidden_size]
+            - V_mem: Value tensor [batch_size, seq_length, hidden_size]
         """
-        # Get hidden states from the transformer
-        outputs = self.transformer(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            output_hidden_states=False,
-            return_dict=True,
+        raise NotImplementedError(
+            "Encoder implementation depends on chosen backbone model"
         )
-
-        # Extract the last hidden state
-        last_hidden_state = outputs.last_hidden_state  # [batch_size, seq_length, hidden_size]
-
-        # Project to explicit KV tensors
-        K_mem = self.key_projection(last_hidden_state)
-        V_mem = self.value_projection(last_hidden_state)
-
-        return K_mem, V_mem
 
     def encode_document(self, text: str, tokenizer) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Encode a single document string.
+        Convenience method to encode a single document.
 
-        Args:
-            text: Document text
-            tokenizer: Tokenizer to use for encoding
-
-        Returns:
-            Tuple of (K_mem, V_mem) for the document
+        This is the typical entry point for populating the LatentMemoryStore.
         """
-        # Tokenize the document
-        encoded = tokenizer(
-            text,
-            max_length=self.config.max_position_embeddings,
-            truncation=True,
-            return_tensors="pt",
-        )
-
-        # Move to the same device as the model
-        device = next(self.parameters()).device
-        encoded = {k: v.to(device) for k, v in encoded.items()}
-
-        # Forward pass
-        with torch.no_grad():
-            K_mem, V_mem = self.forward(**encoded)
-
-        return K_mem, V_mem
-
-    def get_config(self) -> Dict[str, Any]:
-        """Get model configuration."""
-        return self.config.__dict__
+        raise NotImplementedError
