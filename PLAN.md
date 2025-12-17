@@ -40,28 +40,182 @@ A dense decoder-only LLM (e.g., 8B–14B parameter range) augmented with **Gated
 
 ---
 
-## 3. Training Methodology: Contextual Distillation
+## 3. Training Methodology: Staged Contextual Learning
 
-For initial training, we use **Teacher-Student Distillation**.
+Training proceeds through progressive stages, each building on the previous. All stages use an **agentic frame**—the model always simulates reading files before editing, mirroring real-world tool use patterns. This is critical because the awareness context lacks positional encoding; the model must learn to ground itself by explicitly reading target files.
 
-### 3.1 The Objective
-The **Student** (Awareness Model) must replicate the outputs of a **Teacher** (Long-Context SOTA Model), but without seeing the Teacher's context window.
+### 3.1 Stage 0: Context Grounding (Pre-Coding)
 
-*   **Teacher:** Receives `[Instruction + Full Repository Dump]`.
-*   **Student:** Receives `[Instruction]` + `[Latent Memory of Repository]`.
+**Objective:** Teach the decoder to *use* cross-attention over encoded context before introducing code generation complexity.
 
-### 3.2 The Loss Landscape
-1.  **KL Divergence / Cross-Entropy:** The Student must match the Teacher's token distribution.
-2.  **Sparsity Regularization (Optional):** Penalize the encoder for producing redundant KV pairs, encouraging semantic compression.
+#### 3.1.1 Codebase Q&A
 
-### 3.3 Staged joint Encoder - Decoder training
+*   **Data Source:** Repositories with auto-generated questions.
+*   **Question Types:**
+    *   **Structural:** "What files import `utils.py`?", "List all classes in the `/models` directory."
+    *   **Factual:** "What is the return type of `parse_config()`?", "What database does this project use?"
+    *   **Relational:** "Which function calls `authenticate()` and also accesses `user.permissions`?"
+*   **Generation:** Use AST parsing, dependency graphs, and simple templates to generate Q&A pairs automatically. No LLM needed for question generation.
+*   **Agentic Frame:** Model must emit `<read file="...">` tokens before answering, training the read-before-act pattern.
 
-For the encoder training phase we do not need the latent memory store as a condensed entity (with just the encoder outputs). Instead, we:
+#### 3.1.2 Document Corpus Q&A
 
-- Train encoder and decoder jointly (initially freezing / slowing the base decoder network)
-- Train in stages of subsequent agentic code transformations within one repository, for example a sequence of git commits, or a sequence of follow up agentic tasks.
-- Use the fact that many encoded files stay stable across transformation steps.
-- Only recompute encoder passes on changed files between stages.
+*   **Data Source:** Wikipedia, technical documentation, textbooks—any large text corpus.
+*   **Setup:** Encode corpus sections into latent memory. Ask questions answerable only by cross-attending to specific sections.
+*   **Benefit:** Decouples "learning to use cross-attention" from "learning to code," allowing faster iteration on the attention mechanism.
+
+#### 3.1.3 Needle-in-Haystack Variants
+
+*   Embed specific facts in large encoded contexts.
+*   Train retrieval precision: model must locate and cite the correct source chunk.
+*   Gradually increase context size and distractor density.
+
+---
+
+### 3.2 Stage 1: Simple Commit Reproduction
+
+**Objective:** Learn code transformation patterns from real commit data with minimal prompt engineering.
+
+#### 3.2.1 Data Preparation
+
+*   **Source:** Git history from curated repositories.
+*   **Filter:** Single-file commits, pure additions/modifications (no renames, no binary files).
+*   **Context:** Encode the pre-commit repository state into latent memory.
+
+#### 3.2.2 Prompt Variants
+
+Train on multiple prompt formulations to avoid overfitting to a single template:
+
+1.  **Raw Commit Message:**
+    ```
+    User: <commit_message>
+    Agent: <read file="path/to/file.py">
+    [file contents shown]
+    Agent: <edit file="path/to/file.py">
+    [predicted diff or new content]
+    ```
+
+2.  **Commit Message + File Path Hint:**
+    ```
+    User: In `path/to/file.py`: <commit_message>
+    ```
+
+3.  **Imperative Reformulation:**
+    ```
+    User: Modify `file.py` to <action derived from commit message>
+    ```
+
+#### 3.2.3 Training Signal
+
+*   **Target:** The actual commit diff (or post-commit file state).
+*   **Loss:** Standard cross-entropy on the edit output, conditioned on the agentic read.
+
+---
+
+### 3.3 Stage 2: Synthetic Planning Conversations
+
+**Objective:** Improve prompt quality by having an LLM analyze commits and generate realistic user-agent planning dialogues.
+
+#### 3.3.1 Commit Analysis Pipeline
+
+For each commit:
+1.  **Diff Analysis Agent:** Examines the diff and summarizes *what* changed and *why* (inferring intent from code patterns).
+2.  **Prompt Synthesis Agent:** Generates a plausible user request that would lead to this commit.
+3.  **Planning Dialogue Agent:** Simulates a multi-turn conversation:
+    *   User states high-level goal
+    *   Agent asks clarifying questions
+    *   User provides constraints/preferences
+    *   Agent proposes approach
+    *   User approves
+
+#### 3.3.2 Example Synthetic Dialogue
+
+```
+User: The login endpoint is too slow. Can you optimize it?
+Agent: I'll investigate. Let me check the current implementation.
+<read file="auth/login.py">
+[file contents]
+Agent: I see the issue—we're hitting the database twice for user lookup.
+       I can consolidate this into a single query. Should I also add caching?
+User: Just the single query for now, keep it simple.
+Agent: Understood.
+<edit file="auth/login.py">
+[optimized code]
+```
+
+#### 3.3.3 Benefits
+
+*   Richer training signal than raw commit messages (which are often terse or cryptic).
+*   Model learns to handle ambiguity, ask questions, and propose plans.
+*   Closer to real agentic deployment scenarios.
+
+---
+
+### 3.4 Stage 3: Agent-Improved Training Data
+
+**Objective:** Use an LLM to improve or refactor commit code before using it as training targets.
+
+#### 3.4.1 Code Quality Pipeline
+
+1.  **Style Normalization:** Reformat commits to consistent style (removes noise from style variations).
+2.  **Bug Injection/Repair:** Intentionally introduce bugs, train model to fix them.
+3.  **Refactoring:** Take "messy" commits and produce cleaner versions as targets.
+4.  **Documentation:** Add missing docstrings/comments to target code.
+
+#### 3.4.2 Curriculum Design
+
+*   **Easy → Hard:** Start with style-normalized commits, progress to refactored versions.
+*   **Negative Examples:** Include commits that *shouldn't* be made (security vulnerabilities, regressions) with "reject" labels.
+
+---
+
+### 3.5 Stage 4: Full Agentic Distillation
+
+**Objective:** Distill from a long-context teacher LLM performing real agentic tasks.
+
+#### 3.5.1 Teacher-Student Setup
+
+*   **Teacher ($T$):** Long-context SOTA model (e.g., 128k+ context) with full repository access in prompt.
+*   **Student ($S$):** Awareness model with repository in latent memory only.
+
+#### 3.5.2 Task Distribution
+
+*   Real GitHub issues → resolution traces
+*   Multi-file refactoring tasks
+*   Feature implementation from natural language specs
+*   Bug reproduction and fixing
+
+#### 3.5.3 Distillation Variants
+
+1.  **Full Trace Distillation:**
+    *   Teacher performs complete task (reads, plans, edits).
+    *   Student learns to replicate entire trace.
+
+2.  **Filtered Trace Distillation:**
+    *   Remove teacher file reads that don't relate to final edits.
+    *   Student learns efficient attention patterns.
+
+3.  **Output-Only Distillation:**
+    *   Teacher produces final code output.
+    *   Student must independently navigate to same result.
+    *   Harder but encourages genuine understanding.
+
+#### 3.5.4 Loss Functions
+
+1.  **KL Divergence:** Match teacher's token distribution.
+2.  **Behavioral Cloning:** Match teacher's tool-use decisions (which files to read, edit order).
+3.  **Sparsity Regularization:** Penalize encoder for redundant KV pairs—encourage compression.
+
+---
+
+### 3.6 Joint Encoder-Decoder Training
+
+Across all stages:
+
+*   Train encoder ($E_\theta$) and decoder ($D_\phi$) jointly.
+*   Initially freeze or slow-learn the base decoder to stabilize encoder gradients.
+*   Exploit temporal locality: when training on commit sequences, only re-encode changed files.
+*   Gradients flow from decoder loss through cross-attention into encoder, forcing useful representations.
 
 ---
 
