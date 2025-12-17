@@ -144,7 +144,7 @@ memory_store/
 wandb/
 
 # Data crawler artifacts
-data/
+./data/
 *.db
 *.db-journal
 *.db-shm

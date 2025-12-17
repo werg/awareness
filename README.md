@@ -35,13 +35,11 @@ src/awareness/
 │   └── trainer.py      # Training methodology outline
 └── data/
     ├── crawler/        # GitHub repository crawler
-    └── processor/      # Commit extraction and processing
+    └── processor/      # On-the-fly commit extraction
 
 scripts/
 ├── train.py            # Training entry point (stub)
-├── eval.py             # Evaluation entry point (stub)
-├── crawl_repos.py      # Repository crawler script
-└── process_repos.py    # Commit processor script
+└── eval.py             # Evaluation entry point (stub)
 ```
 
 ## Installation
@@ -68,7 +66,7 @@ pip install -e ".[data]"
 
 ## Data Collection
 
-The training process requires git commit history from popular repositories. The `data` module provides tools to crawl GitHub and extract commits as training data.
+The training process requires git commit history from popular repositories. The `data` module provides tools to crawl GitHub and clone repositories. Commits are extracted **on-the-fly during training** directly from the git repos.
 
 ### Configuration
 
@@ -87,7 +85,6 @@ cp .env.example .env
 | `GITHUB_TOKENS` | No | Multiple tokens, comma-separated (for higher throughput) |
 | `AWARENESS_DB_PATH` | No | SQLite database path (default: `./data/crawl_state.db`) |
 | `AWARENESS_REPOS_PATH` | No | Directory for cloned repos (default: `./data/repos`) |
-| `AWARENESS_OUTPUT_PATH` | No | Directory for JSONL output (default: `./data/training`) |
 
 **GitHub Token Setup:**
 
@@ -126,11 +123,55 @@ python -m awareness.data.cli discover --target 100000
 # 3. Download repositories
 python -m awareness.data.cli download --concurrency 10
 
-# 4. Process commits into training data
-python -m awareness.data.cli process
-
-# 5. Check progress
+# 4. Check progress
 python -m awareness.data.cli stats
+```
+
+### Using Downloaded Repos for Training
+
+Commits are extracted on-the-fly during training using `GitCommitDataset`:
+
+```python
+from pathlib import Path
+from awareness.data.processor import GitCommitDataset, CommitDataConfig, get_repo_paths_from_db
+
+# Get repo paths from the crawl database
+repo_paths = get_repo_paths_from_db(
+    db_path=Path("./data/crawl_state.db"),
+    repos_base=Path("./data/repos"),
+)
+
+# Configure extraction
+config = CommitDataConfig(
+    min_message_length=10,
+    max_files_per_commit=20,
+    max_diff_size_bytes=100_000,
+    skip_merge_commits=True,
+)
+
+# Create dataset (iterates over commits from all repos)
+dataset = GitCommitDataset(repo_paths, config)
+
+for commit in dataset:
+    # commit.sha, commit.message, commit.diff, commit.files_changed, etc.
+    train_on(commit)
+```
+
+For PyTorch DataLoader:
+```python
+import torch
+
+class TorchCommitDataset(torch.utils.data.IterableDataset):
+    def __init__(self, repo_paths, config):
+        self.dataset = GitCommitDataset(repo_paths, config)
+
+    def __iter__(self):
+        return iter(self.dataset)
+
+dataloader = torch.utils.data.DataLoader(
+    TorchCommitDataset(repo_paths, config),
+    batch_size=None,  # Dataset yields individual samples
+)
 ```
 
 ### Adaptive Discovery
@@ -184,7 +225,7 @@ The crawler is designed for long-running operations that may be interrupted:
 
 **Idempotent updates:**
 - Re-discovering the same repo updates its metadata (stars, size, etc.)
-- Existing download/processing state is preserved
+- Existing download state is preserved
 - No duplicate entries are created
 
 ```bash
@@ -212,9 +253,6 @@ Re-run discovery to find new repositories and update metadata:
 ```bash
 # Refresh: re-discover all queries, update star counts
 python -m awareness.data.cli refresh
-
-# Reprocess: re-extract commits with updated filters
-python -m awareness.data.cli reprocess --all
 ```
 
 ### CLI Commands
@@ -223,62 +261,35 @@ python -m awareness.data.cli reprocess --all
 |---------|-------------|
 | `discover` | Discover repositories via GitHub Search API |
 | `download` | Clone discovered repositories |
-| `process` | Extract commits into JSONL training data |
 | `stats` | Show database statistics |
 | `refresh` | Re-discover to find new repos and update metadata |
-| `reprocess` | Reset processed repos for re-extraction |
-| `full` | Run complete pipeline (discover → download → process) |
+| `full` | Run complete pipeline (discover → download) |
 
 ### Command Options
 
 **discover**
 ```bash
 python -m awareness.data.cli discover \
-  --target 100000 \          # Target repo count
-  --min-stars 50 \           # Min stars for mainstream (niche: 20, emerging: 10)
-  --include-niche \          # Include niche languages (default: true)
-  --include-emerging \       # Include emerging languages (default: true)
-  --fresh                    # Clear progress and start fresh
+  --target 100000 \
+  --min-stars 50 \
+  --include-niche \
+  --include-emerging \
+  --fresh
 ```
 
 **download**
 ```bash
 python -m awareness.data.cli download \
-  --output ./data/repos \    # Output directory
-  --concurrency 10 \         # Parallel clones
-  --randomize                # Random order for balanced language coverage
+  --output ./data/repos \
+  --concurrency 10 \
+  --randomize
 ```
 
 By default, downloads are ordered by stars (highest first). Use `--randomize` to select repos randomly, which gives you a more balanced language distribution early in the download process.
-
-**process**
-```bash
-python -m awareness.data.cli process \
-  --output ./data/training \ # Output directory for JSONL
-  --workers 4                # Parallel workers
-```
-
-### Output Format
-
-Commits are extracted as JSONL with one record per line:
-
-```json
-{
-  "repo": "facebook/react",
-  "sha": "abc123",
-  "parent_sha": "def456",
-  "message": "Fix memory leak in useEffect",
-  "language": "javascript",
-  "files_changed": ["src/hooks/useEffect.js"],
-  "additions": 15,
-  "deletions": 8,
-  "diff": "diff --git a/..."
-}
-```
 
 ### Estimated Resources
 
 For 100K repositories:
 - **Discovery**: ~2-3 hours (with search API throttling)
 - **Download**: ~4-5 days (10 concurrent clones)
-- **Storage**: ~5TB raw clones, ~500GB-1TB processed JSONL
+- **Storage**: ~5TB raw clones
