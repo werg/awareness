@@ -20,6 +20,19 @@ dev = [
     "pytest>=7.4.0",
 ]
 
+data = [
+    "httpx>=0.27",
+    "aiofiles>=24.0",
+    "aiosqlite>=0.20",
+    "tqdm>=4.66",
+    "tenacity>=8.2",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+awareness-data = "awareness.data.cli:main"
+awareness-crawl = "awareness.data.cli:main"  # Alias for compatibility
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/awareness"]
 

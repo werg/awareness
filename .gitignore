@@ -97,6 +97,7 @@ celerybeat.pid
 
 # Environments
 .env
+.env.local
 .venv
 env/
 venv/
@@ -136,9 +137,24 @@ Thumbs.db
 # Project-specific
 outputs/
 logs/
-data/
 memory_store/
 *.pt
 *.pth
 *.bin
 wandb/
+
+# Data crawler artifacts
+data/
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+crawl_state.db
+*.jsonl
+*.jsonl.gz
+
+# Cloned repositories (very large)
+repos/
+
+# Temporary files from parallel processing
+commits_*.jsonl
