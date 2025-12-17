@@ -239,8 +239,48 @@ Current coding assistants rely on RAG (imprecise) or stuffing context (expensive
 ## 5. Implementation Plan
 
 ### 5.1 Model Selection
-*   **Decoder ($D_\phi$):** Likely models from the Qwen3 series, prototype with a smaller Qwen3 model, then scale up to Qwen3 coder. Alternatively GPT-OSS.
-*   **Encoder ($E_\theta$):** Qwen3 Embedding model.
+
+The Qwen3 series provides an ideal progression path from rapid prototyping to production deployment. See [QWEN3_IMPLEMENTATION.md](QWEN3_IMPLEMENTATION.md) for detailed implementation specifics.
+
+#### 5.1.1 Decoder ($D_\phi$) — Progression Path
+
+| Phase | Model | Parameters | Active Params | Hardware | Purpose |
+|-------|-------|------------|---------------|----------|---------|
+| **Proto-1** | Qwen3-0.6B | 0.6B | 0.6B | Single RTX 3060 | Architecture validation, fast iteration |
+| **Proto-2** | Qwen3-1.7B | 1.7B | 1.7B | Single RTX 3060 | Cross-attention integration testing |
+| **Dev** | Qwen3-4B | 4B | 4B | RTX 4090 / A100-40G | Training pipeline validation |
+| **Scale** | Qwen3-8B | 8B | 8B | A100-40G | Full training runs |
+| **Prod** | Qwen3-30B-A3B | 30.5B | 3.3B | 2× RTX 4090 | Production (MoE efficiency) |
+| **Prod-Alt** | Qwen3-14B | 14.8B | 14.8B | A100-80G | Production (dense alternative) |
+
+**Key Architecture Properties:**
+*   **Grouped Query Attention (GQA):** 4:1 ratio (query:KV heads) — reduces memory, compatible with cross-attention injection
+*   **RoPE:** Base frequency 1M, extendable to 131K tokens via YaRN
+*   **Native Context:** 32K tokens (sufficient for local prompt + scratchpad)
+
+#### 5.1.2 Encoder ($E_\theta$) — Qwen3 Embedding Series
+
+| Model | Parameters | Embedding Dim | Context | MTEB Score |
+|-------|------------|---------------|---------|------------|
+| **Qwen3-Embedding-0.6B** | 0.6B | 1,024 | 32K | — |
+| **Qwen3-Embedding-4B** | 4B | 2,560 | 32K | — |
+| **Qwen3-Embedding-8B** | 8B | 4,096 | 32K | 70.58 (#1) |
+
+**Why Qwen3-Embedding:**
+*   **Architecture Match:** Same tokenizer, compatible hidden dimensions for KV projection
+*   **Bidirectional:** Uses full self-attention (not causal), ideal for document encoding
+*   **Pre-trained for Retrieval:** Already optimized for semantic representation
+*   **MRL Support:** Matryoshka Representation Learning allows flexible embedding dimensions
+
+**Encoder-Decoder Dimension Alignment:**
+
+| Encoder | Encoder Hidden | Decoder | Decoder Hidden | Projection |
+|---------|----------------|---------|----------------|------------|
+| Embedding-0.6B | 1,024 | Qwen3-0.6B | ~1,024 | None needed |
+| Embedding-4B | 2,560 | Qwen3-4B | 2,560 | None needed |
+| Embedding-8B | 4,096 | Qwen3-8B | 4,096 | None needed |
+
+The dimension alignment is intentional — Qwen3 Embedding models were derived from corresponding decoder models.
 
 ### 5.2 Dataset Ideas
 
