@@ -192,17 +192,30 @@ class EncoderKVProjection(nn.Module):
 
 ## 3. Training Infrastructure
 
-### 3.1 Hardware Requirements by Phase
+### 3.1 Training Strategy: Quantized Base + Full-Precision Trainable
 
-| Phase | Model Pair | Training Method | Min VRAM | Recommended Setup |
-|-------|-----------|-----------------|----------|-------------------|
-| Proto-1 | 0.6B + Emb-0.6B | Full fine-tune | 12GB | 1× RTX 3060 |
-| Proto-2 | 1.7B + Emb-0.6B | Full fine-tune | 16GB | 1× RTX 4060 Ti |
-| Dev | 4B + Emb-4B | QLoRA | 24GB | 1× RTX 4090 |
-| Scale | 8B + Emb-8B | QLoRA | 40GB | 1× A100-40G |
-| Prod | 30B-A3B + Emb-8B | QLoRA | 48GB | 2× RTX 4090 |
+We use **INT4 quantized base models** with **BF16 trainable components**. This approach:
 
-### 3.2 Recommended Frameworks
+1. **Strengthens GCA learning**: Degraded base model can't solve tasks alone → stronger gradients for GCA
+2. **Enables joint encoder training**: Encoder learns retrieval-optimized representations
+3. **Saves memory**: INT4 base = 4x larger batches or contexts
+4. **Supports inference swap**: Train on weak base, deploy on full-precision
+
+See [ACCELERATE_INTEGRATION.md](docs/ACCELERATE_INTEGRATION.md) for full details.
+
+### 3.2 Hardware Requirements by Phase
+
+| Phase | Model Pair | Base Precision | Trainable | Min VRAM | Recommended Setup |
+|-------|-----------|----------------|-----------|----------|-------------------|
+| Proto-1 | 0.6B + Emb-0.6B | INT4 (NF4) | BF16 (GCA + Encoder LoRA) | 8GB | 1× RTX 3060 |
+| Proto-2 | 1.7B + Emb-0.6B | INT4 (NF4) | BF16 | 12GB | 1× RTX 4060 Ti |
+| Dev | 4B + Emb-4B | INT4 (NF4) | BF16 | 16GB | 1× RTX 4090 |
+| Scale | 8B + Emb-8B | INT4 (NF4) | BF16/FP8 | 24GB | 1× A100-40G |
+| Prod | 30B-A3B + Emb-8B | INT4 (NF4) | FP8 | 32GB | 2× RTX 4090 |
+
+**Note:** Memory requirements are significantly reduced vs full fine-tuning due to INT4 quantization.
+
+### 3.3 Recommended Frameworks
 
 **Primary:** [Unsloth](https://github.com/unslothai/unsloth)
 - 2× faster training, 70% less VRAM
@@ -219,12 +232,22 @@ class EncoderKVProjection(nn.Module):
 - Required for GCA layer injection
 - More control over training loop
 
-### 3.3 LoRA Configuration
+### 3.4 LoRA Configuration
 
 ```python
 from peft import LoraConfig
 
-# For decoder (with GCA layers)
+# For encoder (ALWAYS trained jointly via LoRA on quantized base)
+encoder_lora_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+    lora_dropout=0.05,
+    bias="none",
+)
+
+# For decoder base model (OPTIONAL - base is frozen by default)
+# Only use if you want to fine-tune the decoder base alongside GCA
 decoder_lora_config = LoraConfig(
     r=32,                    # Rank (16-64 typical)
     lora_alpha=64,           # Alpha = 2× rank
@@ -233,26 +256,17 @@ decoder_lora_config = LoraConfig(
         "q_proj", "k_proj", "v_proj", "o_proj",
         # MLP
         "gate_proj", "up_proj", "down_proj",
-        # Cross-attention (our additions)
-        "cross_attn.q_proj", "cross_attn.k_proj",
-        "cross_attn.v_proj", "cross_attn.o_proj",
     ],
     lora_dropout=0.05,
     bias="none",
     task_type="CAUSAL_LM"
 )
 
-# For encoder (if fine-tuning jointly)
-encoder_lora_config = LoraConfig(
-    r=16,
-    lora_alpha=32,
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-    lora_dropout=0.05,
-    bias="none",
-)
+# NOTE: GCA blocks are trained in full BF16, not via LoRA
+# They are small enough that full fine-tuning is efficient
 ```
 
-### 3.4 Training Hyperparameters
+### 3.5 Training Hyperparameters
 
 ```python
 training_args = TrainingArguments(
@@ -383,13 +397,16 @@ training_args = TrainingArguments(
 
 ### 5.1 Gradient Flow Through Cross-Attention
 
-**Challenge:** Encoder gradients may be weak or unstable.
+**Challenge:** Encoder gradients may be weak or unstable when training jointly with GCA.
 
 **Mitigations:**
 - Initialize GCA gate near zero (stable start)
-- Use gradient scaling: multiply encoder gradients by 10×
-- Warmup: freeze decoder, train encoder-GCA first
+- **Quantized base models**: INT4 decoder can't solve tasks alone → stronger GCA/encoder gradients
+- Use separate learning rates: encoder LR (1e-5) < GCA LR (1e-4)
 - Monitor attention entropy (should decrease over training)
+- Track encoder gradient norms to verify learning signal propagates
+
+**Key Insight:** By degrading the decoder base via quantization, we force the system to rely on cross-attention, which strengthens gradients flowing back to the encoder.
 
 ### 5.2 Memory Store Scaling
 

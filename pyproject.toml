@@ -29,6 +29,36 @@ data = [
     "python-dotenv>=1.0",
 ]
 
+proto1 = [
+    "accelerate>=0.30.0",
+    "tqdm>=4.66",
+    "wandb>=0.16.0",
+]
+
+# FP8 training with TorchAO (recommended for Blackwell)
+# NOTE: Requires nightly PyTorch for best performance. See docs/ACCELERATE_INTEGRATION.md
+fp8 = [
+    "accelerate>=1.0.0",
+    # torchao installed separately via: pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/cu128
+]
+
+# FP8 training with TransformerEngine (alternative)
+fp8-te = [
+    "accelerate>=1.0.0",
+    "transformer-engine[pytorch]>=1.0.0",
+]
+
+# Full Blackwell optimization (both backends available)
+blackwell = [
+    "accelerate>=1.0.0",
+    "transformer-engine[pytorch]>=1.0.0",
+    # torchao installed separately via nightly index
+]
+
+all = [
+    "awareness[dev,data,proto1]",
+]
+
 [project.scripts]
 awareness-data = "awareness.data.cli:main"
 awareness-crawl = "awareness.data.cli:main"  # Alias for compatibility
