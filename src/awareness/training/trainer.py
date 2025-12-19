@@ -1,428 +1,487 @@
-"""Training methodology for the Awareness model.
+"""Accelerate-powered Awareness trainer with quantized base models."""
 
-From PLAN.md Section 3: Staged Contextual Learning
+from __future__ import annotations
 
-Proto-1 Training (Stage 0: Context Grounding):
-- Teach the model to USE cross-attention via needle-in-haystack retrieval
-- Freeze encoder and decoder base, only train GCA blocks initially
-- Success: model learns to retrieve facts from encoded memory
-
-Future Stages (for later implementation):
-- Stage 1: Simple commit reproduction
-- Stage 2: Synthetic planning conversations
-- Stage 3: Agent-improved training data
-- Stage 4: Full agentic distillation with teacher model
-"""
-
-from typing import Dict, Any, Optional, List
 import logging
+import math
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from accelerate import Accelerator
+from accelerate.utils import ProjectConfiguration
 from torch.utils.data import DataLoader
-from tqdm import tqdm
-
-# Optional W&B integration - graceful fallback if not installed
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    wandb = None
-    WANDB_AVAILABLE = False
+from transformers import get_linear_schedule_with_warmup
 
 logger = logging.getLogger(__name__)
 
 
+def build_memory_from_tokens(
+    encoder: nn.Module,
+    context_input_ids: torch.Tensor,
+    context_attention_mask: torch.Tensor,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Convert tokenized context batches into padded memory tensors for the decoder.
+    """
+    context_input_ids = context_input_ids.to(device)
+    context_attention_mask = context_attention_mask.to(device)
+
+    batch_size, num_chunks, seq_len = context_input_ids.shape
+    encoder_dtype = next(encoder.parameters()).dtype
+    hidden_size = encoder.hidden_size
+
+    sample_keys: List[torch.Tensor] = []
+    sample_values: List[torch.Tensor] = []
+    lengths: List[int] = []
+
+    for i in range(batch_size):
+        chunk_ids = context_input_ids[i]
+        chunk_mask = context_attention_mask[i]
+        keys, values = encoder(
+            input_ids=chunk_ids,
+            attention_mask=chunk_mask,
+        )
+        keys = keys.view(-1, hidden_size)
+        values = values.view(-1, hidden_size)
+        flat_mask = chunk_mask.view(-1).bool()
+        keys = keys[flat_mask]
+        values = values[flat_mask]
+        sample_keys.append(keys)
+        sample_values.append(values)
+        lengths.append(keys.size(0))
+
+    max_len = max(lengths) if lengths else 1
+
+    memory_key = torch.zeros(
+        batch_size,
+        max_len,
+        hidden_size,
+        dtype=encoder_dtype,
+        device=device,
+    )
+    memory_value = torch.zeros_like(memory_key)
+    memory_mask = torch.zeros(batch_size, max_len, device=device)
+
+    for i, (keys, values) in enumerate(zip(sample_keys, sample_values)):
+        seq_len = keys.size(0)
+        memory_key[i, :seq_len] = keys
+        memory_value[i, :seq_len] = values
+        memory_mask[i, :seq_len] = 1
+
+    return memory_key, memory_value, memory_mask
+
+
 class AwarenessTrainer:
-    """
-    Trainer for the Awareness model.
-
-    Proto-1 implementation focuses on:
-    1. Encoding context chunks into memory
-    2. Forward pass with cross-attention
-    3. Next-token prediction loss on expected answers
-    4. Monitoring GCA gate values to verify learning
-
-    Training strategy:
-    - Initially freeze encoder AND decoder base model
-    - Only train GCA blocks (gates, projections, norms)
-    - Monitor gate values - they should grow from 0 as the model
-      learns to use cross-attention
-    """
+    """Joint encoder-decoder trainer that integrates HuggingFace Accelerate."""
 
     def __init__(
         self,
+        *,
         encoder: nn.Module,
         decoder: nn.Module,
+        train_dataloader: DataLoader,
         learning_rate: float = 1e-4,
-        device: Optional[str] = None,
+        encoder_learning_rate: float = 1e-5,
         gradient_accumulation_steps: int = 1,
         max_grad_norm: float = 1.0,
+        mixed_precision: str = "bf16",
+        log_with: Optional[str] = None,
+        project_name: Optional[str] = None,
+        tracker_config: Optional[Dict[str, Any]] = None,
+        tracker_init_kwargs: Optional[Dict[str, Any]] = None,
+        output_dir: str = "./outputs",
+        num_training_steps: int = 1000,
+        warmup_steps: int = 100,
         log_interval: int = 10,
-        wandb_project: Optional[str] = None,
-        wandb_run_name: Optional[str] = None,
-        wandb_config: Optional[Dict[str, Any]] = None,
     ):
-        """
-        Initialize the trainer.
-
-        Args:
-            encoder: ContextEncoder instance
-            decoder: AwarenessDecoder instance
-            learning_rate: Learning rate for GCA parameters
-            device: Device to train on (None for auto)
-            gradient_accumulation_steps: Number of steps to accumulate gradients
-            max_grad_norm: Maximum gradient norm for clipping
-            log_interval: How often to log metrics
-            wandb_project: W&B project name (None to disable W&B)
-            wandb_run_name: W&B run name (None for auto-generated)
-            wandb_config: Additional config to log to W&B
-        """
         self.encoder = encoder
         self.decoder = decoder
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.gradient_accumulation_steps = gradient_accumulation_steps
         self.max_grad_norm = max_grad_norm
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.num_training_steps = num_training_steps
         self.log_interval = log_interval
-        self.learning_rate = learning_rate
-
-        # Freeze encoder (for Proto-1, we don't train it)
-        for param in self.encoder.parameters():
-            param.requires_grad = False
-        self.encoder.eval()
-
-        # Freeze decoder base model, only train GCA blocks
-        self.decoder.freeze_base_model()
-
-        # Get trainable parameters (GCA blocks only)
-        trainable_params = self.decoder.get_trainable_parameters(include_base=False)
-        logger.info(f"Training {len(trainable_params)} parameter groups (GCA only)")
-
-        # Count parameters
-        self.total_trainable_params = sum(p.numel() for p in trainable_params)
-        logger.info(f"Total trainable parameters: {self.total_trainable_params:,}")
-
-        # Optimizer
-        self.optimizer = torch.optim.AdamW(trainable_params, lr=learning_rate)
-
-        # Training state
         self.global_step = 0
         self.epoch = 0
 
-        # W&B initialization
-        self.use_wandb = False
-        if wandb_project and WANDB_AVAILABLE:
-            self._init_wandb(wandb_project, wandb_run_name, wandb_config)
-        elif wandb_project and not WANDB_AVAILABLE:
-            logger.warning("W&B requested but not installed. Run: pip install wandb")
+        loggers: Optional[List[str]]
+        if log_with is None:
+            loggers = None
+        elif isinstance(log_with, str):
+            loggers = [log_with]
+        else:
+            loggers = list(log_with)
 
-    def _init_wandb(
-        self,
-        project: str,
-        run_name: Optional[str],
-        extra_config: Optional[Dict[str, Any]],
-    ):
-        """Initialize Weights & Biases logging."""
-        config = {
-            "learning_rate": self.learning_rate,
-            "gradient_accumulation_steps": self.gradient_accumulation_steps,
-            "max_grad_norm": self.max_grad_norm,
-            "trainable_params": self.total_trainable_params,
-            "encoder": getattr(self.encoder, "model", None) and self.encoder.model.config._name_or_path,
-            "decoder": getattr(self.decoder, "model", None) and self.decoder.model.config._name_or_path,
-            "num_gca_layers": len(self.decoder.gca_blocks),
-            "gca_start_layer": self.decoder.gca_start_layer,
-        }
-        if extra_config:
-            config.update(extra_config)
-
-        wandb.init(
-            project=project,
-            name=run_name,
-            config=config,
+        self.accelerator = Accelerator(
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            mixed_precision=mixed_precision,
+            log_with=loggers,
+            project_config=ProjectConfiguration(project_dir=str(output_dir)),
         )
-        self.use_wandb = True
-        logger.info(f"W&B initialized: {wandb.run.url}")
+
+        if hasattr(self.decoder, "freeze_base_model"):
+            self.decoder.freeze_base_model()
+
+        param_groups = [
+            {
+                "params": self.encoder.get_trainable_parameters()
+                if hasattr(self.encoder, "get_trainable_parameters")
+                else [p for p in self.encoder.parameters() if p.requires_grad],
+                "lr": encoder_learning_rate,
+                "name": "encoder",
+            },
+            {
+                "params": self.decoder.get_trainable_parameters(include_base=False)
+                if hasattr(self.decoder, "get_trainable_parameters")
+                else [p for p in self.decoder.parameters() if p.requires_grad],
+                "lr": learning_rate,
+                "name": "gca",
+            },
+        ]
+
+        self.optimizer = torch.optim.AdamW(param_groups)
+        self.scheduler = get_linear_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=num_training_steps,
+        )
+
+        (
+            self.encoder,
+            self.decoder,
+            self.optimizer,
+            self.train_dataloader,
+            self.scheduler,
+        ) = self.accelerator.prepare(
+            self.encoder,
+            self.decoder,
+            self.optimizer,
+            train_dataloader,
+            self.scheduler,
+        )
+
+        if loggers:
+            self.accelerator.init_trackers(
+                project_name or "awareness",
+                config=tracker_config or {},
+                init_kwargs=tracker_init_kwargs or {},
+            )
+
+        self._verify_hooks_active()
+
+    @property
+    def device(self) -> torch.device:
+        return self.accelerator.device
+
+    def _verify_hooks_active(self):
+        """Verify AwarenessDecoder hooks survive accelerator.prepare()."""
+        unwrapped = self.accelerator.unwrap_model(self.decoder)
+        if not hasattr(unwrapped, "gca_blocks") or not hasattr(unwrapped, "_hooks"):
+            return
+        if not getattr(unwrapped, "_hooks", None):
+            return
+
+        hook_count = 0
+        for _, module in unwrapped.named_modules():
+            if hasattr(module, "_forward_hooks"):
+                hook_count += len(module._forward_hooks)
+
+        if hook_count == 0:
+            raise RuntimeError(
+                "GCA hooks not found after accelerator.prepare(). "
+                "Ensure hooks are registered post-wrap."
+            )
+
+        self.accelerator.print(
+            f"✓ Verified {hook_count} GCA hooks active after prepare()"
+        )
 
     def encode_context(
         self,
-        context_chunks: List[List[str]],
-    ) -> tuple:
-        """
-        Encode context chunks into memory tensors.
-
-        Args:
-            context_chunks: List of chunk lists, one per batch item
-
-        Returns:
-            (memory_key, memory_value, memory_mask) tensors
-        """
-        # For simplicity in Proto-1, we process batch items one at a time
-        # and pad to max length
-        all_k = []
-        all_v = []
-        all_mask = []
-
-        with torch.no_grad():
-            for chunks in context_chunks:
-                k, v, mask = self.encoder.encode_documents(chunks)
-                all_k.append(k.squeeze(0))  # Remove batch dim
-                all_v.append(v.squeeze(0))
-                all_mask.append(mask.squeeze(0))
-
-        # Find max memory length
-        max_mem_len = max(k.size(0) for k in all_k)
-
-        # Pad to same length
-        # Use encoder.dtype for hidden state tensors (bfloat16/float16)
-        # Masks stay in default dtype (float32) - they're added to attention scores
-        batch_size = len(all_k)
-        hidden_size = all_k[0].size(-1)
-
-        memory_key = torch.zeros(
-            batch_size, max_mem_len, hidden_size,
-            device=self.encoder.device, dtype=self.encoder.dtype
-        )
-        memory_value = torch.zeros(
-            batch_size, max_mem_len, hidden_size,
-            device=self.encoder.device, dtype=self.encoder.dtype
-        )
-        memory_mask = torch.zeros(batch_size, max_mem_len, device=self.encoder.device)
-
-        for i, (k, v, m) in enumerate(zip(all_k, all_v, all_mask)):
-            seq_len = k.size(0)
-            memory_key[i, :seq_len] = k
-            memory_value[i, :seq_len] = v
-            memory_mask[i, :seq_len] = m
-
-        return memory_key, memory_value, memory_mask
-
-    def train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
-        """
-        Single training step.
-
-        Flow:
-        1. Encode context chunks into memory
-        2. Prepare input: question + answer as single sequence
-        3. Forward pass with cross-attention to memory
-        4. Compute loss on answer portion only
-        5. Backward pass and optimizer step
-
-        Args:
-            batch: Dictionary with context_chunks, question_ids, answer_ids, etc.
-
-        Returns:
-            Dictionary of metrics (loss, gate values, etc.)
-        """
-        self.decoder.train()
-
-        # 1. Encode context into memory
-        memory_key, memory_value, memory_mask = self.encode_context(
-            batch["context_chunks"]
+        context_input_ids: torch.Tensor,
+        context_attention_mask: torch.Tensor,
+    ):
+        """Encode pre-tokenized context tensors into decoder memory."""
+        return build_memory_from_tokens(
+            self.encoder,
+            context_input_ids,
+            context_attention_mask,
+            self.device,
         )
 
-        # 2. Prepare input sequence: question + answer
+    def _prepare_training_input(self, batch: Dict[str, torch.Tensor]):
+        """Concatenate question/answer tokens for teacher forcing."""
         question_ids = batch["question_ids"].to(self.device)
         question_mask = batch["question_mask"].to(self.device)
         answer_ids = batch["answer_ids"].to(self.device)
+        answer_mask = batch["answer_mask"].to(self.device)
 
-        # Concatenate question and answer for teacher forcing
-        # Input: [question tokens] [answer tokens]
-        # Labels: [-100...] [answer tokens] (only compute loss on answer)
         input_ids = torch.cat([question_ids, answer_ids], dim=1)
-
-        # Create attention mask for full sequence
-        answer_mask = torch.ones_like(answer_ids)
         attention_mask = torch.cat([question_mask, answer_mask], dim=1)
-
-        # Create labels: -100 for question tokens (ignored in loss), answer tokens for rest
-        labels = torch.cat([
-            torch.full_like(question_ids, -100),  # Ignore question in loss
-            answer_ids,
-        ], dim=1)
-
-        # 3. Forward pass with memory
-        outputs = self.decoder(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            memory_key=memory_key,
-            memory_value=memory_value,
-            memory_mask=memory_mask,
-            labels=labels,
+        labels = torch.cat(
+            [torch.full_like(question_ids, -100), answer_ids],
+            dim=1,
         )
+        return input_ids, attention_mask, labels
 
-        loss = outputs.loss
+    def _grad_norm(self, params: List[torch.nn.Parameter]) -> float:
+        grads = [
+            p.grad.detach()
+            for p in params
+            if p is not None and p.grad is not None
+        ]
+        if not grads:
+            return 0.0
+        device = grads[0].device
+        total = torch.zeros(1, device=device)
+        for g in grads:
+            total += g.pow(2).sum()
+        return math.sqrt(total.item())
 
-        # 4. Backward pass
-        scaled_loss = loss / self.gradient_accumulation_steps
-        scaled_loss.backward()
+    def train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
+        """Single Accelerate-aware training step."""
+        self.encoder.train()
+        self.decoder.train()
 
-        # 5. Optimizer step (every gradient_accumulation_steps)
-        if (self.global_step + 1) % self.gradient_accumulation_steps == 0:
-            torch.nn.utils.clip_grad_norm_(
-                self.decoder.get_trainable_parameters(),
-                self.max_grad_norm,
+        with self.accelerator.accumulate(self.encoder, self.decoder):
+            memory_key, memory_value, memory_mask = self.encode_context(
+                batch["context_input_ids"],
+                batch["context_attention_mask"],
             )
-            self.optimizer.step()
-            self.optimizer.zero_grad()
+            input_ids, attention_mask, labels = self._prepare_training_input(batch)
+
+            outputs = self.decoder(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                memory_key=memory_key,
+                memory_value=memory_value,
+                memory_mask=memory_mask,
+            )
+            logits = outputs.logits[:, :-1].contiguous()
+            targets = labels[:, 1:].contiguous()
+
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-100,
+            )
+
+            self.accelerator.backward(loss)
+
+            encoder_params = [
+                p for p in self.encoder.parameters() if p.requires_grad
+            ]
+            decoder_params = (
+                self.decoder.get_trainable_parameters(include_base=False)
+                if hasattr(self.decoder, "get_trainable_parameters")
+                else [p for p in self.decoder.parameters() if p.requires_grad]
+            )
+
+            encoder_grad_norm = self._grad_norm(encoder_params)
+            gca_grad_norm = self._grad_norm(decoder_params)
+
+            if self.accelerator.sync_gradients:
+                params = []
+                for group in self.optimizer.param_groups:
+                    params.extend(group["params"])
+                self.accelerator.clip_grad_norm_(params, self.max_grad_norm)
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
 
         self.global_step += 1
 
-        # Collect metrics
-        metrics = {
+        metrics: Dict[str, float] = {
             "loss": loss.item(),
-            "memory_len": memory_key.size(1),
+            "encoder_grad_norm": encoder_grad_norm,
+            "gca_grad_norm": gca_grad_norm,
         }
 
-        # Add gate values
-        gate_values = self.decoder.get_gate_values()
-        metrics.update(gate_values)
-        metrics["avg_gate"] = sum(gate_values.values()) / len(gate_values)
+        unwrapped_decoder = self.accelerator.unwrap_model(self.decoder)
+        if hasattr(unwrapped_decoder, "get_gate_values"):
+            gate_values = unwrapped_decoder.get_gate_values()
+            metrics.update({f"gate/{k}": v for k, v in gate_values.items()})
+            if gate_values:
+                metrics["gate/avg"] = sum(gate_values.values()) / len(gate_values)
 
-        # Log to W&B
-        if self.use_wandb and self.global_step % self.log_interval == 0:
-            wandb_metrics = {
+        if self.accelerator.is_main_process:
+            # Get LRs by name from param groups to avoid index-order assumptions
+            lr_by_name = {}
+            for group in self.optimizer.param_groups:
+                group_name = group.get("name", "unknown")
+                lr_by_name[group_name] = group["lr"]
+
+            log_payload = {
                 "train/loss": metrics["loss"],
-                "train/memory_len": metrics["memory_len"],
-                "train/avg_gate": metrics["avg_gate"],
-                "train/step": self.global_step,
+                "train/lr_encoder": lr_by_name.get("encoder", 0.0),
+                "train/lr_gca": lr_by_name.get("gca", 0.0),
+                "train/encoder_grad_norm": encoder_grad_norm,
+                "train/gca_grad_norm": gca_grad_norm,
             }
-            # Log individual gate values
-            for k, v in gate_values.items():
-                wandb_metrics[f"gates/{k}"] = v
-            wandb.log(wandb_metrics, step=self.global_step)
+            if "gate/avg" in metrics:
+                log_payload["train/gate_avg"] = metrics["gate/avg"]
+            self.accelerator.log(log_payload, step=self.global_step)
 
         return metrics
 
-    def train_epoch(
-        self,
-        dataloader: DataLoader,
-        epoch: int = 0,
-    ) -> Dict[str, float]:
-        """
-        Train for one epoch.
-
-        Args:
-            dataloader: DataLoader providing training batches
-            epoch: Current epoch number (for logging)
-
-        Returns:
-            Dictionary of average metrics for the epoch
-        """
+    def train_epoch(self, epoch: int = 0) -> Dict[str, float]:
+        """Train across one epoch."""
         self.epoch = epoch
-        total_metrics: Dict[str, float] = {}
-        num_batches = 0
+        cumulative: Dict[str, float] = {}
+        steps = 0
 
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
-        for batch in pbar:
+        for step, batch in enumerate(self.train_dataloader):
             metrics = self.train_step(batch)
+            steps += 1
 
-            # Accumulate metrics
-            for k, v in metrics.items():
-                total_metrics[k] = total_metrics.get(k, 0) + v
-            num_batches += 1
+            for key, value in metrics.items():
+                cumulative[key] = cumulative.get(key, 0.0) + value
 
-            # Update progress bar
-            if self.global_step % self.log_interval == 0:
-                pbar.set_postfix({
-                    "loss": f"{metrics['loss']:.4f}",
-                    "gate": f"{metrics['avg_gate']:.4f}",
-                })
+            if (
+                self.accelerator.is_main_process
+                and self.log_interval > 0
+                and step % self.log_interval == 0
+            ):
+                gate = metrics.get("gate/avg", 0.0)
+                self.accelerator.print(
+                    f"Step {step}: loss={metrics['loss']:.4f}, gate={gate:.4f}"
+                )
 
-        # Average metrics
-        avg_metrics = {k: v / num_batches for k, v in total_metrics.items()}
-        return avg_metrics
+        return {k: v / max(steps, 1) for k, v in cumulative.items()}
 
     def train(
         self,
-        dataloader: DataLoader,
-        num_epochs: int = 1,
+        num_epochs: int,
         eval_dataloader: Optional[DataLoader] = None,
-        eval_fn: Optional[callable] = None,
+        eval_fn: Optional[Any] = None,
     ) -> List[Dict[str, float]]:
-        """
-        Main training loop.
-
-        Args:
-            dataloader: Training data loader
-            num_epochs: Number of epochs to train
-            eval_dataloader: Optional evaluation data loader
-            eval_fn: Optional evaluation function
-
-        Returns:
-            List of per-epoch metrics
-        """
-        all_metrics = []
+        """Full training loop with optional evaluation."""
+        history: List[Dict[str, float]] = []
 
         for epoch in range(num_epochs):
-            logger.info(f"Starting epoch {epoch + 1}/{num_epochs}")
-
-            # Train epoch
-            epoch_metrics = self.train_epoch(dataloader, epoch)
-            all_metrics.append(epoch_metrics)
-
-            # Log epoch summary
-            logger.info(
-                f"Epoch {epoch + 1} - "
-                f"Loss: {epoch_metrics['loss']:.4f}, "
-                f"Avg Gate: {epoch_metrics['avg_gate']:.4f}"
+            self.accelerator.print(
+                f"Epoch {epoch + 1}/{num_epochs} (global step {self.global_step})"
             )
+            epoch_metrics = self.train_epoch(epoch)
+            history.append(epoch_metrics)
 
-            # Log epoch metrics to W&B
-            if self.use_wandb:
-                wandb.log({
-                    "epoch/loss": epoch_metrics["loss"],
-                    "epoch/avg_gate": epoch_metrics["avg_gate"],
-                    "epoch": epoch + 1,
-                }, step=self.global_step)
+            if self.accelerator.is_main_process:
+                gate = epoch_metrics.get("gate/avg", 0.0)
+                self.accelerator.print(
+                    f"Epoch {epoch + 1} complete - Loss: {epoch_metrics['loss']:.4f}, "
+                    f"Avg Gate: {gate:.4f}"
+                )
 
-            # Optional evaluation
             if eval_dataloader is not None and eval_fn is not None:
-                eval_metrics = eval_fn(self.decoder, self.encoder, eval_dataloader)
-                logger.info(f"Eval metrics: {eval_metrics}")
+                eval_metrics = eval_fn(
+                    self.accelerator.unwrap_model(self.decoder),
+                    self.accelerator.unwrap_model(self.encoder),
+                    eval_dataloader,
+                )
+                if self.accelerator.is_main_process:
+                    self.accelerator.print(f"Eval metrics: {eval_metrics}")
 
-                # Log eval metrics to W&B
-                if self.use_wandb:
-                    wandb_eval = {"epoch": epoch + 1}
-                    for k, v in eval_metrics.items():
-                        if isinstance(v, (int, float)):
-                            wandb_eval[f"eval/{k}"] = v
-                        elif isinstance(v, dict):
-                            # Handle nested dicts like gate_values
-                            for kk, vv in v.items():
-                                wandb_eval[f"eval/{k}/{kk}"] = vv
-                    wandb.log(wandb_eval, step=self.global_step)
-
-        return all_metrics
-
-    def finish(self):
-        """Clean up resources (call at end of training)."""
-        if self.use_wandb:
-            wandb.finish()
-            logger.info("W&B run finished")
+        return history
 
     def save_checkpoint(self, path: str):
-        """Save training checkpoint."""
-        checkpoint = {
+        """Save encoder/decoder + optimizer/scheduler states."""
+        ckpt = {
+            "encoder": self.accelerator.unwrap_model(self.encoder).state_dict(),
+            "decoder": self.accelerator.unwrap_model(self.decoder).state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "scheduler": self.scheduler.state_dict(),
             "global_step": self.global_step,
             "epoch": self.epoch,
-            "gca_blocks": {k: v.state_dict() for k, v in self.decoder.gca_blocks.items()},
-            "gca_norms": {k: v.state_dict() for k, v in self.decoder.gca_norms.items()},
-            "optimizer": self.optimizer.state_dict(),
         }
-        torch.save(checkpoint, path)
-        logger.info(f"Saved checkpoint to {path}")
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.accelerator.save(ckpt, path)
 
     def load_checkpoint(self, path: str):
-        """Load training checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
+        """Load checkpoint produced by save_checkpoint."""
+        state = torch.load(path, map_location="cpu")
+        self.accelerator.unwrap_model(self.encoder).load_state_dict(
+            state["encoder"], strict=False
+        )
+        self.accelerator.unwrap_model(self.decoder).load_state_dict(
+            state["decoder"], strict=False
+        )
+        self.optimizer.load_state_dict(state["optimizer"])
+        self.scheduler.load_state_dict(state["scheduler"])
+        self.global_step = state.get("global_step", 0)
+        self.epoch = state.get("epoch", 0)
 
-        self.global_step = checkpoint["global_step"]
-        self.epoch = checkpoint["epoch"]
+    def finish(self):
+        """Clean up Accelerator trackers."""
+        self.accelerator.wait_for_everyone()
+        self.accelerator.end_training()
 
-        for k, state_dict in checkpoint["gca_blocks"].items():
-            self.decoder.gca_blocks[k].load_state_dict(state_dict)
-        for k, state_dict in checkpoint["gca_norms"].items():
-            self.decoder.gca_norms[k].load_state_dict(state_dict)
 
-        self.optimizer.load_state_dict(checkpoint["optimizer"])
-        logger.info(f"Loaded checkpoint from {path} (step {self.global_step})")
+def validate_quantized_training(
+    trainer: AwarenessTrainer,
+    validation_dataloader: DataLoader,
+    num_steps: int = 100,
+) -> Dict[str, Any]:
+    """
+    Lightweight sanity check to ensure quantized joint training behaves as expected.
+    """
+    torch.manual_seed(42)
+    losses: List[float] = []
+    gate_values: List[float] = []
+    encoder_grad_norms: List[float] = []
+
+    dataloader_iter = iter(validation_dataloader)
+
+    for step in range(num_steps):
+        try:
+            batch = next(dataloader_iter)
+        except StopIteration:
+            dataloader_iter = iter(validation_dataloader)
+            batch = next(dataloader_iter)
+
+        metrics = trainer.train_step(batch)
+        losses.append(metrics["loss"])
+        encoder_grad_norms.append(metrics.get("encoder_grad_norm", 0.0))
+        gate_values.append(metrics.get("gate/avg", 0.0))
+
+    result = {
+        "loss_start": losses[0],
+        "loss_end": losses[-1],
+        "loss_decreased": losses[-1] < losses[0],
+        "gate_start": gate_values[0],
+        "gate_end": gate_values[-1],
+        "gate_increased": gate_values[-1] > gate_values[0],
+        "encoder_grad_mean": sum(encoder_grad_norms) / len(encoder_grad_norms),
+        "encoder_receiving_gradients": encoder_grad_norms[-1] > 0,
+        "no_nan": not any(math.isnan(l) for l in losses),
+    }
+
+    trainer.accelerator.print("\n=== Quantized Training Validation ===")
+    trainer.accelerator.print(
+        f"Loss: {result['loss_start']:.4f} → {result['loss_end']:.4f} "
+        f"({'✓' if result['loss_decreased'] else '✗'})"
+    )
+    trainer.accelerator.print(
+        f"Gate: {result['gate_start']:.4f} → {result['gate_end']:.4f} "
+        f"({'✓' if result['gate_increased'] else '✗'})"
+    )
+    trainer.accelerator.print(
+        "Encoder gradients: "
+        f"{'✓' if result['encoder_receiving_gradients'] else '✗'} "
+        f"(mean norm: {result['encoder_grad_mean']:.6f})"
+    )
+    trainer.accelerator.print(f"No NaN: {'✓' if result['no_nan'] else '✗'}")
+
+    passed = all(
+        [
+            result["loss_decreased"],
+            result["gate_increased"],
+            result["encoder_receiving_gradients"],
+            result["no_nan"],
+        ]
+    )
+
+    trainer.accelerator.print(f"\nOverall: {'PASSED ✓' if passed else 'FAILED ✗'}")
+    return result

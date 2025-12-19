@@ -1,0 +1,11 @@
+compute_environment: LOCAL_MACHINE
+distributed_type: NO
+mixed_precision: bf16
+num_processes: 1
+use_cpu: false
+
+quantization:
+  base_models: int4
+  trainable_components: bf16
+  encoder_lora_r: 16
+  encoder_lora_alpha: 32

@@ -16,25 +16,47 @@ Or run with defaults:
 
 import argparse
 import logging
+import math
 import random
 import sys
 from functools import partial
 from pathlib import Path
+from typing import Optional
 
 import torch
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    wandb = None
+    WANDB_AVAILABLE = False
 from torch.utils.data import DataLoader
+from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
+
+try:
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    PEFT_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    LoraConfig = None
+    get_peft_model = None
+    prepare_model_for_kbit_training = None
+    PEFT_AVAILABLE = False
 
 # Add src to path for development
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from awareness.config import Proto1Config
 from awareness.models.encoder import ContextEncoder
 from awareness.models.awareness_decoder import AwarenessDecoder
 from awareness.data.synthetic.needle_haystack import (
     NeedleHaystackDataset,
     collate_needle_haystack,
 )
-from awareness.training.trainer import AwarenessTrainer
+from awareness.training.trainer import (
+    AwarenessTrainer,
+    validate_quantized_training,
+    build_memory_from_tokens,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,6 +78,9 @@ def evaluate(
     encoder: ContextEncoder,
     dataloader: DataLoader,
     num_samples: int = 100,
+    accelerator=None,
+    step: Optional[int] = None,
+    prefix: str = "eval",
 ) -> dict:
     """
     Evaluate needle-in-haystack retrieval accuracy.
@@ -65,83 +90,166 @@ def evaluate(
         encoder: ContextEncoder
         dataloader: Evaluation data loader
         num_samples: Maximum number of samples to evaluate
+        accelerator: Accelerator instance for logging (uses accelerator.log())
+        step: Global step for logging
+        prefix: Prefix for metric names (e.g., "eval", "initial", "final")
 
     Returns:
         Dictionary with accuracy and other metrics
     """
-    decoder.eval()
+    base_decoder = getattr(decoder, "module", decoder)
+    base_encoder = getattr(encoder, "module", encoder)
+    base_decoder.eval()
     correct = 0
     total = 0
+
+    logger.info(f"Starting evaluation (max {num_samples} samples)...")
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             if total >= num_samples:
                 break
 
-            # Encode context
-            all_k, all_v, all_mask = [], [], []
-            for chunks in batch["context_chunks"]:
-                k, v, mask = encoder.encode_documents(chunks)
-                all_k.append(k)
-                all_v.append(v)
-                all_mask.append(mask)
+            logger.info(f"Eval batch {batch_idx + 1}, samples so far: {total}/{num_samples}")
 
-            # Pad memory tensors
-            # Use encoder.dtype for hidden state tensors (bfloat16/float16)
-            # Masks stay in default dtype (float32) - they're added to attention scores
-            max_mem_len = max(k.size(1) for k in all_k)
-            batch_size = len(all_k)
+            context_input_ids = batch["context_input_ids"].to(base_encoder.device)
+            context_attention_mask = batch["context_attention_mask"].to(base_encoder.device)
 
-            memory_key = torch.zeros(
-                batch_size, max_mem_len, encoder.hidden_size,
-                device=encoder.device, dtype=encoder.dtype
+            logger.info(f"  Encoding context...")
+            memory_key, memory_value, memory_mask = build_memory_from_tokens(
+                base_encoder,
+                context_input_ids,
+                context_attention_mask,
+                base_encoder.device,
             )
-            memory_value = torch.zeros(
-                batch_size, max_mem_len, encoder.hidden_size,
-                device=encoder.device, dtype=encoder.dtype
-            )
-            memory_mask = torch.zeros(
-                batch_size, max_mem_len, device=encoder.device
-            )
+            logger.info(f"  Context encoded, memory shape: {memory_key.shape}")
 
-            for i, (k, v, m) in enumerate(zip(all_k, all_v, all_mask)):
-                seq_len = k.size(1)
-                memory_key[i, :seq_len] = k.squeeze(0)
-                memory_value[i, :seq_len] = v.squeeze(0)
-                memory_mask[i, :seq_len] = m.squeeze(0)
+            question_ids = batch["question_ids"].to(base_decoder.device)
+            question_mask = batch["question_mask"].to(base_decoder.device)
 
-            # Generate answers
-            question_ids = batch["question_ids"].to(decoder.device)
-
-            generated = decoder.generate(
+            logger.info(f"  Generating response...")
+            generated = base_decoder.generate(
                 input_ids=question_ids,
+                attention_mask=question_mask,
                 memory_key=memory_key,
                 memory_value=memory_value,
                 memory_mask=memory_mask,
                 max_new_tokens=20,
                 do_sample=False,
-                pad_token_id=decoder.tokenizer.pad_token_id,
+                pad_token_id=base_decoder.tokenizer.pad_token_id,
             )
+            logger.info(f"  Generation complete")
 
             # Decode and check accuracy
-            for i in range(len(batch["raw_answers"])):
-                expected = batch["raw_answers"][i].lower()
-                generated_text = decoder.tokenizer.decode(
+            for i in range(len(batch["answer_ids"])):
+                answer_mask = batch["answer_mask"][i].bool()
+                expected = base_decoder.tokenizer.decode(
+                    batch["answer_ids"][i][answer_mask],
+                    skip_special_tokens=True,
+                ).lower()
+                generated_text = base_decoder.tokenizer.decode(
                     generated[i][question_ids.size(1):],
                     skip_special_tokens=True,
                 ).lower()
 
-                if expected in generated_text:
+                if expected and expected in generated_text:
                     correct += 1
                 total += 1
 
     accuracy = correct / total if total > 0 else 0
+    logger.info(f"Evaluation complete: {correct}/{total} = {accuracy:.2%}")
+
+    gate_values = (
+        base_decoder.get_gate_values()
+        if hasattr(base_decoder, "get_gate_values")
+        else {}
+    )
+    avg_gate = sum(gate_values.values()) / len(gate_values) if gate_values else 0.0
+
+    # Log via Accelerate's tracker (handles W&B internally)
+    if accelerator is not None and accelerator.is_main_process:
+        log_dict = {
+            f"{prefix}/accuracy": accuracy,
+            f"{prefix}/correct": correct,
+            f"{prefix}/total": total,
+            f"{prefix}/gate_avg": avg_gate,
+        }
+        for k, v in gate_values.items():
+            log_dict[f"{prefix}/gate/{k}"] = v
+        accelerator.log(log_dict, step=step)
+
     return {
         "accuracy": accuracy,
         "correct": correct,
         "total": total,
-        "gate_values": decoder.get_gate_values(),
+        "gate_values": gate_values,
     }
+
+
+def build_bitsandbytes_config() -> BitsAndBytesConfig:
+    return BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+    )
+
+
+def load_encoder(
+    model_name: str,
+    quantize: bool,
+    bnb_config: Optional[BitsAndBytesConfig],
+    lora_r: int,
+    lora_alpha: int,
+) -> ContextEncoder:
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+    if quantize:
+        if not PEFT_AVAILABLE:
+            raise ImportError(
+                "peft must be installed to enable quantized encoder training."
+            )
+        base_model = AutoModel.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            quantization_config=bnb_config,
+        )
+        base_model = prepare_model_for_kbit_training(base_model)
+        lora_config = LoraConfig(
+            r=lora_r,
+            lora_alpha=lora_alpha,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            lora_dropout=0.05,
+            bias="none",
+        )
+        base_model = get_peft_model(base_model, lora_config)
+        return ContextEncoder(
+            model_name=model_name,
+            base_model=base_model,
+            tokenizer=tokenizer,
+            torch_dtype=torch.bfloat16,
+        )
+
+    return ContextEncoder(
+        model_name=model_name,
+        tokenizer=tokenizer,
+        torch_dtype=torch.bfloat16,
+    )
+
+
+def load_decoder(
+    model_name: str,
+    quantize: bool,
+    bnb_config: Optional[BitsAndBytesConfig],
+) -> AwarenessDecoder:
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    return AwarenessDecoder(
+        model_name=model_name,
+        tokenizer=tokenizer,
+        torch_dtype=torch.bfloat16,
+        quantization_config=bnb_config if quantize else None,
+    )
 
 
 def main():
@@ -168,7 +276,13 @@ def main():
         "--learning-rate",
         type=float,
         default=1e-4,
-        help="Learning rate",
+        help="Learning rate for GCA blocks",
+    )
+    parser.add_argument(
+        "--encoder-lr",
+        type=float,
+        default=1e-5,
+        help="Learning rate for encoder parameters",
     )
     parser.add_argument(
         "--num-epochs",
@@ -214,14 +328,71 @@ def main():
     parser.add_argument(
         "--wandb-project",
         type=str,
-        default=None,
-        help="W&B project name (None to disable W&B logging)",
+        default="awareness",
+        help="W&B project name (use --no-wandb to disable)",
     )
     parser.add_argument(
         "--wandb-run-name",
         type=str,
         default=None,
         help="W&B run name (None for auto-generated)",
+    )
+    parser.add_argument(
+        "--no-wandb",
+        action="store_true",
+        help="Disable W&B logging",
+    )
+    parser.add_argument(
+        "--quantize-base",
+        action="store_true",
+        help="Enable INT4 quantization for encoder/decoder bases",
+    )
+    parser.add_argument(
+        "--encoder-lora-r",
+        type=int,
+        default=16,
+        help="LoRA rank for encoder adapters",
+    )
+    parser.add_argument(
+        "--encoder-lora-alpha",
+        type=int,
+        default=32,
+        help="LoRA alpha for encoder adapters",
+    )
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=1,
+        help="Accelerate gradient accumulation steps",
+    )
+    parser.add_argument(
+        "--mixed-precision",
+        type=str,
+        default="bf16",
+        help="Accelerate mixed precision setting (bf16/fp16/no)",
+    )
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=100,
+        help="Learning rate warmup steps",
+    )
+    parser.add_argument(
+        "--validate-quantized",
+        action="store_true",
+        help="Run the quantized training validation gate before full training",
+    )
+    parser.add_argument(
+        "--validation-steps",
+        type=int,
+        default=50,
+        help="Steps to run during quantized validation",
+    )
+    parser.add_argument(
+        "--max-training-steps",
+        type=int,
+        default=None,
+        help="Optional cap on total training steps",
     )
 
     args = parser.parse_args()
@@ -241,37 +412,49 @@ def main():
     logger.info(f"Output: {output_dir}")
     logger.info("=" * 60)
 
-    # Initialize models
+    bnb_config = build_bitsandbytes_config() if args.quantize_base else None
+
     logger.info("Loading encoder...")
-    encoder = ContextEncoder(
+    encoder = load_encoder(
         model_name=args.encoder_model,
-        torch_dtype=torch.bfloat16,
+        quantize=args.quantize_base,
+        bnb_config=bnb_config,
+        lora_r=args.encoder_lora_r,
+        lora_alpha=args.encoder_lora_alpha,
     )
     logger.info(f"Encoder loaded: {encoder}")
 
     logger.info("Loading decoder with GCA...")
-    decoder = AwarenessDecoder(
+    decoder = load_decoder(
         model_name=args.decoder_model,
-        torch_dtype=torch.bfloat16,
+        quantize=args.quantize_base,
+        bnb_config=bnb_config,
     )
     logger.info(f"Decoder loaded: {decoder}")
 
     # Create datasets
+    # Use reasonable context length - 5 sentences ~50-100 tokens, use 256 for padding headroom
+    context_chunk_length = 256
+
     logger.info("Creating training dataset...")
     train_dataset = NeedleHaystackDataset(
         tokenizer=decoder.tokenizer,
+        encoder_tokenizer=encoder.tokenizer,
         num_examples=args.num_train_examples,
         num_chunks=10,
         sentences_per_chunk=5,
+        context_max_length=context_chunk_length,
         seed=args.seed,
     )
 
     logger.info("Creating evaluation dataset...")
     eval_dataset = NeedleHaystackDataset(
         tokenizer=decoder.tokenizer,
+        encoder_tokenizer=encoder.tokenizer,
         num_examples=args.num_eval_examples,
         num_chunks=10,
         sentences_per_chunk=5,
+        context_max_length=context_chunk_length,
         seed=args.seed + 1,  # Different seed for eval
     )
 
@@ -294,49 +477,109 @@ def main():
         collate_fn=collate_fn,
     )
 
-    # Initialize trainer with optional W&B
-    wandb_config = {
+    # Initialize W&B (enabled by default, use --no-wandb to disable)
+    # NOTE: We don't call wandb.init() here - Accelerate's init_trackers() handles it
+    # This avoids conflict between manual init and Accelerate's tracker management
+    use_wandb = args.wandb_project is not None and not args.no_wandb
+    if use_wandb and not WANDB_AVAILABLE:
+        logger.warning("W&B requested but not installed. Disabling W&B logging.")
+        use_wandb = False
+
+    # Config dict to pass to Accelerate's init_trackers
+    tracker_config = {
         "encoder_model": args.encoder_model,
         "decoder_model": args.decoder_model,
         "batch_size": args.batch_size,
+        "learning_rate": args.learning_rate,
+        "encoder_lr": args.encoder_lr,
         "num_epochs": args.num_epochs,
         "num_train_examples": args.num_train_examples,
         "num_eval_examples": args.num_eval_examples,
         "seed": args.seed,
+        "quantize_base": args.quantize_base,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "mixed_precision": args.mixed_precision,
+        "warmup_steps": args.warmup_steps,
+        "encoder_lora_r": args.encoder_lora_r,
+        "encoder_lora_alpha": args.encoder_lora_alpha,
     }
+
+    effective_batches_per_epoch = math.ceil(
+        args.num_train_examples / args.batch_size
+    )
+    total_training_steps = args.max_training_steps or (
+        effective_batches_per_epoch * args.num_epochs
+    )
 
     trainer = AwarenessTrainer(
         encoder=encoder,
         decoder=decoder,
+        train_dataloader=train_loader,
         learning_rate=args.learning_rate,
-        gradient_accumulation_steps=8,
-        log_interval=10,
-        wandb_project=args.wandb_project,
-        wandb_run_name=args.wandb_run_name,
-        wandb_config=wandb_config,
+        encoder_learning_rate=args.encoder_lr,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision=args.mixed_precision,
+        log_with="wandb" if use_wandb else None,
+        project_name=args.wandb_project,
+        tracker_config=tracker_config if use_wandb else None,
+        tracker_init_kwargs={"wandb": {"name": args.wandb_run_name}} if use_wandb and args.wandb_run_name else None,
+        output_dir=str(output_dir),
+        num_training_steps=total_training_steps,
+        warmup_steps=args.warmup_steps,
     )
+
+    if use_wandb:
+        logger.info(f"W&B logging enabled for project: {args.wandb_project}")
 
     # Load checkpoint if provided
     if args.checkpoint:
         trainer.load_checkpoint(args.checkpoint)
 
     if args.eval_only:
-        # Just run evaluation
         logger.info("Running evaluation...")
-        eval_metrics = evaluate(decoder, encoder, eval_loader, num_samples=100)
+        eval_metrics = evaluate(
+            trainer.accelerator.unwrap_model(trainer.decoder),
+            trainer.accelerator.unwrap_model(trainer.encoder),
+            eval_loader,
+            num_samples=100,
+            accelerator=trainer.accelerator if use_wandb else None,
+            step=0,
+            prefix="eval",
+        )
         logger.info(f"Evaluation results: {eval_metrics}")
+        trainer.finish()
         return
 
     # Training loop
+    if args.validate_quantized:
+        logger.info("Running quantized validation gate...")
+        validate_quantized_training(
+            trainer,
+            trainer.train_dataloader,
+            num_steps=args.validation_steps,
+        )
+
     logger.info("Starting training...")
     logger.info(f"Train examples: {args.num_train_examples}")
     logger.info(f"Batch size: {args.batch_size}")
-    logger.info(f"Gradient accumulation: 8")
-    logger.info(f"Effective batch: {args.batch_size * 8}")
+    logger.info(
+        f"Gradient accumulation: {args.gradient_accumulation_steps}"
+    )
+    logger.info(
+        f"Effective batch: {args.batch_size * args.gradient_accumulation_steps}"
+    )
 
     # Initial evaluation
     logger.info("Initial evaluation...")
-    eval_metrics = evaluate(decoder, encoder, eval_loader, num_samples=50)
+    eval_metrics = evaluate(
+        trainer.accelerator.unwrap_model(trainer.decoder),
+        trainer.accelerator.unwrap_model(trainer.encoder),
+        eval_loader,
+        num_samples=50,
+        accelerator=trainer.accelerator if use_wandb else None,
+        step=0,
+        prefix="initial",
+    )
     logger.info(f"Initial accuracy: {eval_metrics['accuracy']:.2%}")
 
     # Train
@@ -345,27 +588,50 @@ def main():
         logger.info(f"Epoch {epoch + 1}/{args.num_epochs}")
         logger.info(f"{'='*60}")
 
-        epoch_metrics = trainer.train_epoch(train_loader, epoch)
+        epoch_metrics = trainer.train_epoch(epoch)
+        avg_gate = epoch_metrics.get("gate/avg", 0.0)
         logger.info(
             f"Epoch {epoch + 1} complete - "
             f"Loss: {epoch_metrics['loss']:.4f}, "
-            f"Avg Gate: {epoch_metrics['avg_gate']:.4f}"
+            f"Avg Gate: {avg_gate:.4f}"
         )
 
-        # Evaluation
-        eval_metrics = evaluate(decoder, encoder, eval_loader, num_samples=100)
+        eval_metrics = evaluate(
+            trainer.accelerator.unwrap_model(trainer.decoder),
+            trainer.accelerator.unwrap_model(trainer.encoder),
+            eval_loader,
+            num_samples=100,
+            accelerator=trainer.accelerator if use_wandb else None,
+            step=trainer.global_step,
+            prefix="eval",
+        )
         logger.info(f"Eval accuracy: {eval_metrics['accuracy']:.2%}")
         logger.info(f"Gate values: {eval_metrics['gate_values']}")
 
-        # Save checkpoint
         checkpoint_path = output_dir / f"checkpoint_epoch{epoch + 1}.pt"
         trainer.save_checkpoint(str(checkpoint_path))
+
+        # Log epoch summary via Accelerate's tracker
+        if use_wandb and trainer.accelerator.is_main_process:
+            trainer.accelerator.log({
+                "epoch": epoch + 1,
+                "epoch/loss": epoch_metrics["loss"],
+                "epoch/gate_avg": epoch_metrics.get("gate/avg", 0.0),
+            }, step=trainer.global_step)
 
     # Final evaluation
     logger.info("\n" + "=" * 60)
     logger.info("Final Evaluation")
     logger.info("=" * 60)
-    eval_metrics = evaluate(decoder, encoder, eval_loader, num_samples=args.num_eval_examples)
+    eval_metrics = evaluate(
+        trainer.accelerator.unwrap_model(trainer.decoder),
+        trainer.accelerator.unwrap_model(trainer.encoder),
+        eval_loader,
+        num_samples=args.num_eval_examples,
+        accelerator=trainer.accelerator if use_wandb else None,
+        step=trainer.global_step,
+        prefix="final",
+    )
     logger.info(f"Final accuracy: {eval_metrics['accuracy']:.2%}")
     logger.info(f"Final gate values: {eval_metrics['gate_values']}")
 
@@ -390,7 +656,7 @@ def main():
     else:
         logger.info("NEEDS INVESTIGATION: Check training dynamics")
 
-    # Clean up W&B
+    # Clean up (Accelerate's end_training() handles W&B finish)
     trainer.finish()
 
 

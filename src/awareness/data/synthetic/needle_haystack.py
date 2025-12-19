@@ -225,11 +225,13 @@ class NeedleHaystackDataset(IterableDataset):
     def __init__(
         self,
         tokenizer,
+        encoder_tokenizer=None,
         num_examples: int = 10000,
         num_chunks: int = 10,
         sentences_per_chunk: int = 5,
         max_question_length: int = 64,
         max_answer_length: int = 32,
+        context_max_length: int = 512,
         seed: Optional[int] = None,
     ):
         """
@@ -245,6 +247,7 @@ class NeedleHaystackDataset(IterableDataset):
             seed: Random seed for reproducibility
         """
         self.tokenizer = tokenizer
+        self.encoder_tokenizer = encoder_tokenizer
         self.num_examples = num_examples
         self.generator = NeedleHaystackGenerator(
             num_chunks=num_chunks,
@@ -253,6 +256,12 @@ class NeedleHaystackDataset(IterableDataset):
         )
         self.max_question_length = max_question_length
         self.max_answer_length = max_answer_length
+        self.context_max_length = context_max_length
+
+        if self.encoder_tokenizer is None:
+            raise ValueError(
+                "NeedleHaystackDataset requires an encoder_tokenizer to produce tokenized context chunks."
+            )
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
         """Iterate over generated examples."""
@@ -267,10 +276,9 @@ class NeedleHaystackDataset(IterableDataset):
         Format an example for training.
 
         Returns a dict with:
-        - context_chunks: List of chunk strings (for encoding)
+        - context_input_ids/context_attention_mask: Tokenized context chunks
         - question: Tokenized question
         - answer: Tokenized answer (for loss computation)
-        - raw: Original example (for debugging)
         """
         # Format question with prompt template
         question_text = f"Question: {example.question}\nAnswer:"
@@ -294,14 +302,21 @@ class NeedleHaystackDataset(IterableDataset):
             add_special_tokens=False,  # Don't add BOS to answer
         )
 
+        context_inputs = self.encoder_tokenizer(
+            example.context_chunks,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.context_max_length,
+            padding="max_length",
+        )
+
         return {
-            "context_chunks": example.context_chunks,
+            "context_input_ids": context_inputs["input_ids"],
+            "context_attention_mask": context_inputs["attention_mask"],
             "question_ids": question_tokens["input_ids"].squeeze(0),
             "question_mask": question_tokens["attention_mask"].squeeze(0),
             "answer_ids": answer_tokens["input_ids"].squeeze(0),
-            "needle_chunk_idx": example.needle_chunk_idx,
-            "raw_question": example.question,
-            "raw_answer": example.answer,
+            "needle_chunk_idx": torch.tensor(example.needle_chunk_idx, dtype=torch.long),
         }
 
 
@@ -340,16 +355,22 @@ def collate_needle_haystack(
 
     # Pad answers (right-pad since we generate left-to-right)
     answer_ids = torch.full((len(batch), max_a_len), pad_token_id, dtype=torch.long)
+    answer_mask = torch.zeros((len(batch), max_a_len), dtype=torch.long)
     for i, item in enumerate(batch):
         a_len = item["answer_ids"].size(0)
         answer_ids[i, :a_len] = item["answer_ids"]
+        answer_mask[i, :a_len] = 1
+
+    context_input_ids = torch.stack([item["context_input_ids"] for item in batch])
+    context_attention_mask = torch.stack([item["context_attention_mask"] for item in batch])
+    needle_chunk_idx = torch.stack([item["needle_chunk_idx"] for item in batch])
 
     return {
-        "context_chunks": [item["context_chunks"] for item in batch],
+        "context_input_ids": context_input_ids,
+        "context_attention_mask": context_attention_mask,
         "question_ids": question_ids,
         "question_mask": question_mask,
         "answer_ids": answer_ids,
-        "needle_chunk_idx": [item["needle_chunk_idx"] for item in batch],
-        "raw_questions": [item["raw_question"] for item in batch],
-        "raw_answers": [item["raw_answer"] for item in batch],
+        "answer_mask": answer_mask,
+        "needle_chunk_idx": needle_chunk_idx,
     }

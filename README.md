@@ -60,9 +60,32 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 # Core package
 pip install -e .
 
+# With training dependencies (includes accelerate, bitsandbytes, peft, wandb)
+pip install -e ".[training]"
+
 # With data crawling dependencies
 pip install -e ".[data]"
+
+# Everything
+pip install -e ".[training,data]"
 ```
+
+### Set up Weights & Biases (optional, for experiment tracking)
+
+[Weights & Biases](https://wandb.ai) provides experiment tracking, metric visualization, and model monitoring.
+
+1. **Create a W&B account** at https://wandb.ai/signup (free for personal use)
+
+2. **Login to W&B**:
+   ```bash
+   wandb login
+   ```
+   This prompts for your API key, available at https://wandb.ai/authorize
+
+   Alternatively, set the API key as an environment variable:
+   ```bash
+   export WANDB_API_KEY=your_api_key_here
+   ```
 
 ## Data Collection
 
@@ -293,3 +316,68 @@ For 100K repositories:
 - **Discovery**: ~2-3 hours (with search API throttling)
 - **Download**: ~4-5 days (10 concurrent clones)
 - **Storage**: ~5TB raw clones
+
+## Training
+
+### Proto-1: Architecture Validation
+
+The `train_proto1.py` script validates the GCA architecture using a synthetic needle-in-haystack task.
+
+```bash
+# Basic training run (W&B enabled by default)
+python scripts/train_proto1.py
+
+# With custom W&B run name
+python scripts/train_proto1.py --wandb-run-name "run-001"
+
+# With quantized base models (saves VRAM, may be slower for generation)
+python scripts/train_proto1.py --quantize-base
+
+# Disable W&B logging
+python scripts/train_proto1.py --no-wandb
+
+# Full example
+python scripts/train_proto1.py \
+    --wandb-project my-project \
+    --wandb-run-name "experiment-1" \
+    --batch-size 4 \
+    --num-epochs 5 \
+    --learning-rate 1e-4 \
+    --encoder-lr 1e-5
+```
+
+### Training Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--encoder-model` | `Qwen/Qwen3-Embedding-0.6B` | Encoder model |
+| `--decoder-model` | `Qwen/Qwen3-0.6B` | Decoder model |
+| `--batch-size` | 2 | Training batch size |
+| `--learning-rate` | 1e-4 | Learning rate for GCA blocks |
+| `--encoder-lr` | 1e-5 | Learning rate for encoder |
+| `--num-epochs` | 3 | Number of training epochs |
+| `--quantize-base` | off | Enable INT4 quantization |
+| `--wandb-project` | `awareness` | W&B project name |
+| `--wandb-run-name` | None | W&B run name (auto-generated if not set) |
+| `--no-wandb` | off | Disable W&B logging |
+
+### W&B Metrics
+
+When W&B is enabled, the following metrics are logged:
+
+- **Training**: `train/loss`, `train/gate_avg`, `train/lr_encoder`, `train/lr_gca`
+- **Evaluation**: `eval/accuracy`, `eval/gate_avg`, per-layer gate values
+- **Epochs**: `epoch/loss`, `epoch/gate_avg`
+
+### Offline Training
+
+For machines without internet access:
+```bash
+export WANDB_MODE=offline
+python scripts/train_proto1.py --wandb-project awareness-proto1
+
+# Sync runs later
+wandb sync ./wandb/offline-run-*
+```
+
+See [docs/ACCELERATE_INTEGRATION.md](docs/ACCELERATE_INTEGRATION.md) for detailed training configuration.

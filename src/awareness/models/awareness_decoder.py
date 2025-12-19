@@ -11,7 +11,8 @@ Key design decisions:
 - RMSNorm before GCA: Follows Qwen3 pre-norm pattern
 """
 
-from typing import Optional, Dict, Any, List
+from contextlib import contextmanager
+from typing import Optional, Dict, Any, List, Tuple
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
@@ -33,9 +34,13 @@ class AwarenessDecoder(nn.Module):
     def __init__(
         self,
         model_name: str = "Qwen/Qwen3-0.6B",
+        *,
+        base_model: Optional[nn.Module] = None,
+        tokenizer: Optional[Any] = None,
         device: Optional[str] = None,
         torch_dtype: Optional[torch.dtype] = None,
         trust_remote_code: bool = True,
+        quantization_config: Optional[Any] = None,
     ):
         """
         Initialize the AwarenessDecoder.
@@ -48,23 +53,31 @@ class AwarenessDecoder(nn.Module):
         """
         super().__init__()
 
-        # Load configuration first to get architecture details
-        self.config = AutoConfig.from_pretrained(
-            model_name, trust_remote_code=trust_remote_code
-        )
+        if base_model is not None:
+            self.model = base_model
+            self.config = base_model.config
+        else:
+            # Load configuration first to get architecture details
+            self.config = AutoConfig.from_pretrained(
+                model_name, trust_remote_code=trust_remote_code
+            )
 
-        # Load the base Qwen3 model
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch_dtype or torch.bfloat16,
-            device_map=device or "auto",
-            trust_remote_code=trust_remote_code,
-        )
+            # Load the base Qwen3 model
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch_dtype or torch.bfloat16,
+                device_map=device or "auto",
+                trust_remote_code=trust_remote_code,
+                quantization_config=quantization_config,
+            )
 
         # Load tokenizer (left padding for decoder-only generation)
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_name, trust_remote_code=trust_remote_code
-        )
+        if tokenizer is not None:
+            self.tokenizer = tokenizer
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_name, trust_remote_code=trust_remote_code
+            )
         self.tokenizer.padding_side = "left"
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -176,6 +189,48 @@ class AwarenessDecoder(nn.Module):
 
         return hook
 
+    @contextmanager
+    def _memory_context(
+        self,
+        memory_key: Optional[torch.Tensor],
+        memory_value: Optional[torch.Tensor],
+        memory_mask: Optional[torch.Tensor],
+    ):
+        """
+        Context manager for safe memory handling during forward/generate.
+
+        Ensures memory is always cleared even if an exception occurs,
+        preventing stale memory from affecting subsequent calls.
+        """
+        # Store previous state (for nested calls, though unlikely)
+        prev_memory = self._memory
+        prev_mask = self._memory_mask
+
+        try:
+            if memory_key is not None and memory_value is not None:
+                target_device = self.device
+                target_dtype = self.dtype
+                memory_key = memory_key.to(device=target_device, dtype=target_dtype)
+                memory_value = memory_value.to(device=target_device, dtype=target_dtype)
+                self._memory = (memory_key, memory_value)
+                if memory_mask is not None:
+                    memory_mask = memory_mask.to(
+                        device=target_device, dtype=torch.float32
+                    )
+                    # Convert [batch, mem_len] -> [batch, 1, 1, mem_len] for broadcasting
+                    # 1 -> 0 (attend), 0 -> -inf (mask)
+                    self._memory_mask = (1.0 - memory_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+                else:
+                    self._memory_mask = None
+            else:
+                self._memory = None
+                self._memory_mask = None
+            yield
+        finally:
+            # Always restore previous state (usually None)
+            self._memory = prev_memory
+            self._memory_mask = prev_mask
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -201,39 +256,19 @@ class AwarenessDecoder(nn.Module):
         Returns:
             CausalLMOutput with loss (if labels provided), logits, etc.
         """
-        # Store memory for hooks to access
-        if memory_key is not None and memory_value is not None:
-            self._memory = (memory_key, memory_value)
-
-            # Convert memory mask to attention mask format if provided
-            if memory_mask is not None:
-                # Convert [batch, mem_len] -> [batch, 1, 1, mem_len] for broadcasting
-                # 1 -> 0 (attend), 0 -> -inf (mask)
-                self._memory_mask = (1.0 - memory_mask.unsqueeze(1).unsqueeze(2)) * -1e9
-            else:
-                self._memory_mask = None
-        else:
-            self._memory = None
-            self._memory_mask = None
-
-        try:
-            # Forward through base model (hooks will inject GCA)
+        with self._memory_context(memory_key, memory_value, memory_mask):
             outputs = self.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 labels=labels,
                 **kwargs,
             )
-        finally:
-            # Clear memory after forward pass
-            self._memory = None
-            self._memory_mask = None
-
         return outputs
 
     def generate(
         self,
         input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
         memory_key: Optional[torch.Tensor] = None,
         memory_value: Optional[torch.Tensor] = None,
         memory_mask: Optional[torch.Tensor] = None,
@@ -247,6 +282,7 @@ class AwarenessDecoder(nn.Module):
 
         Args:
             input_ids: Input token IDs [batch, seq_len]
+            attention_mask: Attention mask for input [batch, seq_len] (important for batched generation)
             memory_key: K_mem from encoder [batch, mem_len, hidden]
             memory_value: V_mem from encoder [batch, mem_len, hidden]
             memory_mask: Mask for memory positions [batch, mem_len]
@@ -255,25 +291,12 @@ class AwarenessDecoder(nn.Module):
         Returns:
             Generated token IDs [batch, seq_len + new_tokens]
         """
-        # Store memory for hooks to access during generation
-        if memory_key is not None and memory_value is not None:
-            self._memory = (memory_key, memory_value)
-
-            if memory_mask is not None:
-                self._memory_mask = (1.0 - memory_mask.unsqueeze(1).unsqueeze(2)) * -1e9
-            else:
-                self._memory_mask = None
-        else:
-            self._memory = None
-            self._memory_mask = None
-
-        try:
-            outputs = self.model.generate(input_ids=input_ids, **kwargs)
-        finally:
-            # Clear memory after generation
-            self._memory = None
-            self._memory_mask = None
-
+        with self._memory_context(memory_key, memory_value, memory_mask):
+            outputs = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
         return outputs
 
     def get_gate_values(self) -> Dict[str, float]:
@@ -327,6 +350,39 @@ class AwarenessDecoder(nn.Module):
         for hook in self._hooks:
             hook.remove()
         self._hooks = []
+
+    def verify_hooks(self) -> int:
+        """
+        Verify GCA hooks are still active.
+
+        Returns:
+            Number of active hooks found.
+
+        Raises:
+            RuntimeError: If no hooks are found when GCA blocks exist.
+        """
+        hook_count = 0
+        for _, module in self.named_modules():
+            if hasattr(module, "_forward_hooks"):
+                hook_count += len(module._forward_hooks)
+
+        expected_hooks = len(self.gca_blocks)
+        if hook_count == 0 and expected_hooks > 0:
+            raise RuntimeError(
+                f"No GCA hooks found but {expected_hooks} GCA blocks exist. "
+                "Hooks may have been lost during model wrapping."
+            )
+        return hook_count
+
+    def reregister_hooks(self):
+        """
+        Remove and re-register all GCA hooks.
+
+        Call this after operations that may have invalidated hooks
+        (e.g., model wrapping, device transfers).
+        """
+        self.remove_hooks()
+        self._register_hooks()
 
     def __repr__(self) -> str:
         return (
