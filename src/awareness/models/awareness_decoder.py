@@ -304,10 +304,10 @@ class AwarenessDecoder(nn.Module):
         Get current gate values for all GCA blocks.
 
         Returns:
-            Dict mapping layer index to tanh(gate) value
+            Dict mapping layer index to sigmoid(gate) value (0 to 1)
         """
         return {
-            f"layer_{k}": torch.tanh(block.gate).item()
+            f"layer_{k}": torch.sigmoid(block.gate).item()
             for k, block in self.gca_blocks.items()
         }
 

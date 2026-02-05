@@ -57,8 +57,9 @@ class GatedCrossAttention(nn.Module):
         self.o_proj = nn.Linear(num_heads * self.head_dim, hidden_size, bias=False)
 
         # Learnable gate (initialized near zero for stable training start)
-        # Using a scalar parameter, gated via tanh to bound in [-1, 1]
-        self.gate = nn.Parameter(torch.zeros(1))
+        # Using sigmoid to bound in (0, 1) - represents fraction of memory to incorporate
+        # Initialize to -4 so sigmoid(-4) ≈ 0.018, starting near zero
+        self.gate = nn.Parameter(torch.tensor([-4.0]))
 
     def forward(
         self,
@@ -126,9 +127,9 @@ class GatedCrossAttention(nn.Module):
         attn_output = self.o_proj(attn_output)
 
         # Gated residual connection
-        # Gate is initialized to 0, so initially this returns hidden_states unchanged
-        # As training progresses, gate learns to incorporate memory information
-        gate_value = torch.tanh(self.gate)
+        # Gate uses sigmoid, bounded to (0, 1) representing fraction of memory to use
+        # Initialized near 0 (sigmoid(-4) ≈ 0.018), learns to increase as memory becomes useful
+        gate_value = torch.sigmoid(self.gate)
         return hidden_states + gate_value * attn_output
 
 
