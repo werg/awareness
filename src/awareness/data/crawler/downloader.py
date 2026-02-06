@@ -272,7 +272,10 @@ class RepoDownloader:
 
         while True:
             # Get next batch
-            repos = await self.db.get_pending_repos(batch_size=batch_size, randomize=randomize)
+            repos = await self.db.get_pending_repos(
+                batch_size=batch_size, randomize=randomize,
+                max_size_kb=self.config.max_repo_size_kb,
+            )
 
             if not repos:
                 break

@@ -122,9 +122,13 @@ async def cmd_download(args):
         max_concurrent_downloads=args.concurrency,
         clone_timeout_seconds=args.timeout,
         github_tokens=tokens,
+        max_repo_size_kb=args.max_size * 1024 if args.max_size else None,
     )
 
     async with CrawlOrchestrator(config) as orchestrator:
+        if config.max_repo_size_kb:
+            print(f"Filtering repos larger than {args.max_size} MB (GitHub API estimate)")
+
         if args.resume:
             print("Resuming interrupted crawl...")
             stats = await orchestrator.resume_crawl(batch_size=args.batch_size)
@@ -244,6 +248,27 @@ async def cmd_refresh(args):
     return 0
 
 
+async def cmd_reconcile(args):
+    """Check for repos whose local directories are missing and fix DB state."""
+    from awareness.data.crawler.config import CrawlerConfig
+    from awareness.data.crawler.orchestrator import CrawlOrchestrator
+
+    config = CrawlerConfig(
+        db_path=Path(args.db),
+    )
+
+    async with CrawlOrchestrator(config) as orchestrator:
+        print("Checking for repos with missing local directories...")
+        stats = await orchestrator.reconcile_missing()
+
+        print(f"\nReconciliation complete:")
+        print(f"  Checked:  {stats['checked']}")
+        print(f"  OK:       {stats['ok']}")
+        print(f"  Missing:  {stats['missing']} (marked as failed)")
+
+    return 0
+
+
 async def cmd_full(args):
     """Run full crawl pipeline: discover + download."""
     from awareness.data.crawler.config import CrawlerConfig
@@ -262,6 +287,7 @@ async def cmd_full(args):
         max_concurrent_downloads=args.concurrency,
         github_tokens=tokens,
         exclude_forks=not args.include_forks,
+        max_repo_size_kb=args.max_size * 1024 if args.max_size else None,
     )
 
     async with CrawlOrchestrator(config) as orchestrator:
@@ -347,6 +373,10 @@ def main():
         "--randomize", action="store_true",
         help="Select repos randomly for balanced language coverage (default: order by stars)"
     )
+    download_parser.add_argument(
+        "--max-size", type=int, default=None,
+        help="Maximum repo size in MB (based on GitHub API size estimate). Repos larger than this are skipped."
+    )
 
     # Stats command
     subparsers.add_parser("stats", help="Show statistics")
@@ -386,6 +416,16 @@ def main():
         "--no-emerging", action="store_false", dest="include_emerging",
         help="Exclude emerging languages"
     )
+    full_parser.add_argument(
+        "--max-size", type=int, default=None,
+        help="Maximum repo size in MB (based on GitHub API size estimate). Repos larger than this are skipped."
+    )
+
+    # Reconcile command
+    subparsers.add_parser(
+        "reconcile",
+        help="Check for repos marked as downloaded whose local files are missing, and mark them as failed"
+    )
 
     # Refresh command - for periodic re-runs
     refresh_parser = subparsers.add_parser(
@@ -414,6 +454,8 @@ def main():
         return asyncio.run(cmd_full(args))
     elif args.command == "refresh":
         return asyncio.run(cmd_refresh(args))
+    elif args.command == "reconcile":
+        return asyncio.run(cmd_reconcile(args))
 
     return 1
 

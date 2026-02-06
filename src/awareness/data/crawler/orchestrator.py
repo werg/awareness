@@ -216,6 +216,33 @@ class CrawlOrchestrator:
         # Continue downloads
         return await self.download_repos(batch_size=batch_size)
 
+    async def reconcile_missing(self) -> dict:
+        """Find repos marked as downloaded/processed whose local files are missing.
+
+        Marks them as failed with a descriptive reason. Returns statistics.
+        """
+        from pathlib import Path
+
+        repos = await self.db.get_repos_with_local_paths()
+        missing = []
+
+        for full_name, local_path, status, size_kb in repos:
+            if not local_path or not Path(local_path).exists():
+                missing.append((full_name, local_path, status, size_kb))
+
+        for full_name, local_path, status, size_kb in missing:
+            size_mb = (size_kb or 0) / 1024
+            await self.db.mark_failed(
+                full_name,
+                f"reconciled: local directory missing (was {status}, ~{size_mb:.0f} MB)",
+            )
+
+        return {
+            "checked": len(repos),
+            "missing": len(missing),
+            "ok": len(repos) - len(missing),
+        }
+
     async def get_progress(self) -> dict:
         """Get current crawl progress."""
         stats = await self.db.get_stats()

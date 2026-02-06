@@ -199,7 +199,8 @@ class CrawlDatabase:
             return min(row["count"], limit)
 
     async def get_pending_repos(
-        self, batch_size: int = 100, randomize: bool = False
+        self, batch_size: int = 100, randomize: bool = False,
+        max_size_kb: Optional[int] = None,
     ) -> List[RepoMetadata]:
         """Get next batch of repos to download.
 
@@ -207,18 +208,25 @@ class CrawlDatabase:
             batch_size: Number of repos to fetch
             randomize: If True, select randomly for balanced language coverage.
                        If False, order by stars descending (default).
+            max_size_kb: If set, exclude repos larger than this (KB).
         """
         order_clause = "RANDOM()" if randomize else "stars DESC"
+        size_filter = "AND (size_kb IS NULL OR size_kb <= ?)" if max_size_kb else ""
+        params: list = []
+        if max_size_kb:
+            params.append(max_size_kb)
+        params.append(batch_size)
         async with self._db.execute(
             f"""
             SELECT full_name, stars, language, license_key, size_kb,
                    default_branch, fork, archived
             FROM repositories
             WHERE status = 'pending'
+            {size_filter}
             ORDER BY {order_clause}
             LIMIT ?
             """,
-            (batch_size,),
+            params,
         ) as cursor:
             rows = await cursor.fetchall()
             return [
@@ -463,6 +471,26 @@ class CrawlDatabase:
         ) as cursor:
             rows = await cursor.fetchall()
             return [(row["full_name"], row["local_path"], row["language"]) for row in rows]
+
+    async def get_repos_with_local_paths(self) -> List[tuple]:
+        """Get all repos that claim to have a local clone on disk.
+
+        Returns list of (full_name, local_path, status, size_kb) for repos
+        in 'downloaded' or 'processed' status with a local_path set.
+        """
+        async with self._db.execute(
+            """
+            SELECT full_name, local_path, status, size_kb
+            FROM repositories
+            WHERE status IN ('downloaded', 'processed')
+            AND local_path IS NOT NULL
+            """
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [
+                (row["full_name"], row["local_path"], row["status"], row["size_kb"])
+                for row in rows
+            ]
 
     async def count_by_status(self, status: RepoStatus) -> int:
         """Count repos with given status."""
