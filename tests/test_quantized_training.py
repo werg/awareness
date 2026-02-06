@@ -41,7 +41,7 @@ class DummyEncoder(nn.Module):
 
     def forward(self, input_ids, attention_mask=None, output_hidden_states=True):
         hidden = self.embedding(input_ids)
-        return SimpleNamespace(last_hidden_state=hidden)
+        return hidden, hidden  # (K_mem, V_mem) matching ContextEncoder interface
 
     def get_trainable_parameters(self):
         return list(self.parameters())
