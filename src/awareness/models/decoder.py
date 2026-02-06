@@ -56,10 +56,13 @@ class GatedCrossAttention(nn.Module):
         # Output projection
         self.o_proj = nn.Linear(num_heads * self.head_dim, hidden_size, bias=False)
 
-        # Learnable gate (initialized near zero for stable training start)
+        # Learnable gate (initialized so projections get meaningful gradients)
         # Using sigmoid to bound in (0, 1) - represents fraction of memory to incorporate
-        # Initialize to -4 so sigmoid(-4) ≈ 0.018, starting near zero
-        self.gate = nn.Parameter(torch.tensor([-4.0]))
+        # Initialize to -1 so sigmoid(-1) ≈ 0.27 with gradient ≈ 0.20
+        # This breaks the chicken-and-egg deadlock: projections receive ~27% of
+        # full gradient (vs ~1.8% at -4), letting them learn useful patterns
+        # which in turn gives the gate a consistent signal to grow.
+        self.gate = nn.Parameter(torch.tensor([-1.0]))
 
     def forward(
         self,
@@ -67,15 +70,19 @@ class GatedCrossAttention(nn.Module):
         memory_key: torch.Tensor,
         memory_value: torch.Tensor,
         memory_mask: Optional[torch.Tensor] = None,
+        residual: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Apply gated cross-attention to memory.
 
         Args:
             hidden_states: Decoder hidden states [batch, seq_len, hidden]
+                (typically RMSNorm'd for query projection)
             memory_key: K_mem from encoder [batch, mem_len, hidden]
             memory_value: V_mem from encoder [batch, mem_len, hidden]
             memory_mask: Optional attention mask [batch, 1, 1, mem_len] or broadcastable
+            residual: Original (pre-norm) hidden states for the residual connection.
+                If None, hidden_states is used (backward-compatible).
 
         Returns:
             Updated hidden states with memory-aware representations (gated residual)
@@ -128,9 +135,10 @@ class GatedCrossAttention(nn.Module):
 
         # Gated residual connection
         # Gate uses sigmoid, bounded to (0, 1) representing fraction of memory to use
-        # Initialized near 0 (sigmoid(-4) ≈ 0.018), learns to increase as memory becomes useful
+        # Residual adds to original (pre-norm) hidden states, not the normed version
         gate_value = torch.sigmoid(self.gate)
-        return hidden_states + gate_value * attn_output
+        base = residual if residual is not None else hidden_states
+        return base + gate_value * attn_output
 
 
 class ReasoningDecoder(nn.Module):

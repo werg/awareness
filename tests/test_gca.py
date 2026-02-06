@@ -23,8 +23,8 @@ class TestGatedCrossAttention:
         assert gca.num_kv_heads == 4
         assert gca.head_dim == 32  # 256 / 8
 
-        # Gate should be initialized to 0
-        assert gca.gate.item() == 0.0
+        # Gate param initialized to -1 (sigmoid(-1) ≈ 0.27)
+        assert gca.gate.item() == -1.0
 
     def test_forward_shape(self):
         """Test that forward pass produces correct output shape."""
@@ -48,8 +48,8 @@ class TestGatedCrossAttention:
         assert output.shape == hidden_states.shape
         assert output.shape == (batch_size, seq_len, hidden_size)
 
-    def test_gate_initialization_effect(self):
-        """Test that gate=0 means output equals input initially."""
+    def test_gate_zero_identity(self):
+        """Test that gate_param=large_negative means output ≈ input (residual passthrough)."""
         batch_size = 2
         seq_len = 16
         mem_len = 32
@@ -60,8 +60,9 @@ class TestGatedCrossAttention:
             num_heads=8,
         )
 
-        # Ensure gate is 0
-        assert gca.gate.item() == 0.0
+        # Force gate to near-zero output
+        with torch.no_grad():
+            gca.gate.fill_(-20.0)  # sigmoid(-20) ≈ 0
 
         hidden_states = torch.randn(batch_size, seq_len, hidden_size)
         memory_key = torch.randn(batch_size, mem_len, hidden_size)
@@ -69,8 +70,35 @@ class TestGatedCrossAttention:
 
         output = gca(hidden_states, memory_key, memory_value)
 
-        # With gate=0, tanh(0)=0, so output should equal input
+        # With sigmoid(-20)≈0, output should equal input (residual passthrough)
         assert torch.allclose(output, hidden_states, atol=1e-6)
+
+    def test_residual_uses_original(self):
+        """Test that passing residual separately preserves the original hidden states."""
+        batch_size = 2
+        seq_len = 16
+        mem_len = 32
+        hidden_size = 256
+
+        gca = GatedCrossAttention(
+            hidden_size=hidden_size,
+            num_heads=8,
+        )
+
+        # Force gate to near-zero
+        with torch.no_grad():
+            gca.gate.fill_(-20.0)
+
+        hidden_states = torch.randn(batch_size, seq_len, hidden_size)
+        residual = torch.randn(batch_size, seq_len, hidden_size)
+        memory_key = torch.randn(batch_size, mem_len, hidden_size)
+        memory_value = torch.randn(batch_size, mem_len, hidden_size)
+
+        output = gca(hidden_states, memory_key, memory_value, residual=residual)
+
+        # With gate≈0, output should equal the residual, not hidden_states
+        assert torch.allclose(output, residual, atol=1e-6)
+        assert not torch.allclose(output, hidden_states, atol=1e-3)
 
     def test_gate_nonzero_effect(self):
         """Test that nonzero gate changes output."""
@@ -94,7 +122,7 @@ class TestGatedCrossAttention:
 
         output = gca(hidden_states, memory_key, memory_value)
 
-        # With gate=1.0, tanh(1.0)≈0.76, so output should differ from input
+        # With gate=1.0, sigmoid(1.0)≈0.73, so output should differ from input
         assert not torch.allclose(output, hidden_states, atol=1e-3)
 
     def test_gradient_flow(self):

@@ -172,7 +172,10 @@ class AwarenessDecoder(nn.Module):
                 hidden_states = output
                 rest = ()
 
-            # Apply GCA: norm -> cross-attention -> residual (handled inside GCA)
+            # Apply GCA: norm -> cross-attention -> gated residual
+            # Pass normed hidden states for query projection, but original
+            # hidden states as the residual base (Flamingo-style pre-norm pattern:
+            # y = x + gate * CrossAttn(Norm(x)))
             memory_key, memory_value = self._memory
             normed = self.gca_norms[layer_key](hidden_states)
             hidden_states = self.gca_blocks[layer_key](
@@ -180,6 +183,7 @@ class AwarenessDecoder(nn.Module):
                 memory_key,
                 memory_value,
                 memory_mask=self._memory_mask,
+                residual=hidden_states,
             )
 
             # Return in same format
