@@ -20,6 +20,30 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from .decoder import GatedCrossAttention
 
 
+class Float32RMSNorm(nn.Module):
+    """RMSNorm that stores weight in float32 for optimizer precision,
+    but casts it to input dtype for the fused kernel path.
+
+    Standard nn.RMSNorm with float32 weight receiving bf16 input triggers
+    a 'mismatch dtype' warning and disables the fused CUDA implementation.
+    This subclass avoids both issues.
+    """
+
+    def __init__(self, normalized_shape: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(normalized_shape, dtype=torch.float32))
+
+    def _apply(self, fn):
+        """Keep weight in float32 through .to(), .bfloat16(), etc."""
+        super()._apply(fn)
+        self.weight.data = self.weight.data.float()
+        return self
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.rms_norm(x, self.weight.shape, self.weight.to(x.dtype), self.eps)
+
+
 class AwarenessDecoder(nn.Module):
     """
     Qwen3 decoder augmented with Gated Cross-Attention in the upper 1/3 of layers.
@@ -109,8 +133,9 @@ class AwarenessDecoder(nn.Module):
                 attn_dropout=gca_attn_dropout,
                 output_dropout=gca_output_dropout,
             )
-            # Use RMSNorm like Qwen3 (pre-norm architecture)
-            self.gca_norms[layer_key] = nn.RMSNorm(
+            # Float32RMSNorm: weight stays float32 for optimizer precision
+            # but casts to input dtype in forward for fused kernel path
+            self.gca_norms[layer_key] = Float32RMSNorm(
                 self.hidden_size, eps=self.rms_norm_eps
             )
 
@@ -146,24 +171,6 @@ class AwarenessDecoder(nn.Module):
             block.to(device=device, dtype=dtype)
         for norm in self.gca_norms.values():
             norm.to(device=device, dtype=dtype)
-
-        self._keep_norms_float32()
-
-    def _keep_norms_float32(self):
-        """Keep RMSNorm gains in float32 for optimizer precision.
-
-        RMSNorm weight is initialized to 1.0. bfloat16 ULP at 1.0 is ~0.008,
-        which swallows AdamW updates of ~1e-4, freezing the gains.
-        """
-        for norm in self.gca_norms.values():
-            if hasattr(norm, "weight") and norm.weight is not None:
-                norm.weight.data = norm.weight.data.float()
-
-    def _apply(self, fn):
-        """Preserve float32 on GCA norms through dtype conversions."""
-        super()._apply(fn)
-        self._keep_norms_float32()
-        return self
 
     def _register_hooks(self):
         """Register forward hooks on decoder layers to inject GCA."""

@@ -147,6 +147,9 @@ def evaluate(
                 memory_mask=memory_mask,
                 max_new_tokens=20,
                 do_sample=False,
+                temperature=None,
+                top_p=None,
+                top_k=None,
                 pad_token_id=base_decoder.tokenizer.pad_token_id,
             )
             logger.info(f"  Generation complete")
