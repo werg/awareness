@@ -279,7 +279,18 @@ class NeedleHaystackDataset(IterableDataset):
             )
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
-        """Iterate over generated examples."""
+        """Iterate over generated examples.
+
+        When used with DataLoader(num_workers>0), each worker re-seeds
+        based on its worker id to avoid producing duplicate data.
+        """
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            # Re-seed for this worker so each produces different data
+            worker_seed = (self.generator.sentences_per_chunk
+                           + worker_info.id * 9999
+                           + id(self))
+            random.seed(worker_seed)
         for example in self.generator.generate(self.num_examples):
             yield self._format_example(example)
 

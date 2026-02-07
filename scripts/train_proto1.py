@@ -18,6 +18,7 @@ import argparse
 import logging
 import math
 import random
+import re
 import sys
 from functools import partial
 from pathlib import Path
@@ -159,7 +160,12 @@ def evaluate(
                     skip_special_tokens=True,
                 ).lower()
 
-                is_correct = bool(expected and expected in generated_text)
+                # Use word-boundary match to avoid false positives on short
+                # answers like "True", "0", "None" appearing inside other words.
+                is_correct = bool(
+                    expected
+                    and re.search(r'(?<!\w)' + re.escape(expected) + r'(?!\w)', generated_text)
+                )
                 if is_correct:
                     correct += 1
                 total += 1
