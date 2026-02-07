@@ -241,10 +241,79 @@ class AwarenessTrainer:
             total += g.pow(2).sum()
         return math.sqrt(total.item())
 
+    def _collect_attention_metrics(
+        self,
+        unwrapped_decoder,
+        batch: Dict[str, Any],
+        memory_mask: torch.Tensor,
+    ) -> Dict[str, float]:
+        """Collect attention entropy and needle precision from stored weights."""
+        metrics: Dict[str, float] = {}
+        if not hasattr(unwrapped_decoder, "gca_blocks"):
+            return metrics
+
+        all_entropy = []
+        all_needle_prec = []
+        needle_chunk_idx = batch.get("needle_chunk_idx")
+
+        for key, block in unwrapped_decoder.gca_blocks.items():
+            weights = block._last_attn_weights  # [batch, heads, seq, mem]
+            if weights is None:
+                continue
+
+            # Attention entropy: -sum(p * log(p + eps)) averaged over heads and seq positions
+            eps = 1e-8
+            entropy = -(weights * torch.log(weights + eps)).sum(dim=-1)  # [batch, heads, seq]
+            avg_entropy = entropy.mean().item()
+            all_entropy.append(avg_entropy)
+
+            # Needle precision: fraction of attention on the needle chunk's tokens
+            if needle_chunk_idx is not None and memory_mask is not None:
+                # memory_mask shape: [batch, mem_len] (1=real, 0=pad)
+                # Context chunks are concatenated: each chunk has context_max_length tokens
+                # needle_chunk_idx: [batch] — which chunk is the needle
+                batch_size = weights.size(0)
+                mem_len = weights.size(-1)
+                context_input_ids = batch.get("context_input_ids")
+                if context_input_ids is not None:
+                    num_chunks = context_input_ids.size(1)
+                    chunk_len = context_input_ids.size(2)
+                    # Build per-sample needle mask over memory positions
+                    needle_mask = torch.zeros(batch_size, mem_len, device=weights.device)
+                    for i in range(batch_size):
+                        idx = needle_chunk_idx[i].item()
+                        start = idx * chunk_len
+                        end = min(start + chunk_len, mem_len)
+                        needle_mask[i, start:end] = 1.0
+                    # Compute attention mass on needle tokens: [batch, heads, seq]
+                    needle_attn = (weights * needle_mask.unsqueeze(1).unsqueeze(2)).sum(dim=-1)
+                    avg_needle_prec = needle_attn.mean().item()
+                    all_needle_prec.append(avg_needle_prec)
+
+            # Clear stored weights
+            block._last_attn_weights = None
+
+        if all_entropy:
+            metrics["attn_entropy"] = sum(all_entropy) / len(all_entropy)
+        if all_needle_prec:
+            metrics["needle_precision"] = sum(all_needle_prec) / len(all_needle_prec)
+
+        return metrics
+
     def train_step(self, batch: Dict[str, Any]) -> Dict[str, float]:
         """Single Accelerate-aware training step."""
         self.encoder.train()
         self.decoder.train()
+
+        # Enable attention storage at log intervals for diagnostics
+        should_log_attn = (
+            self.log_interval > 0
+            and self.global_step % self.log_interval == 0
+        )
+        unwrapped_dec_pre = self.accelerator.unwrap_model(self.decoder)
+        if should_log_attn and hasattr(unwrapped_dec_pre, "gca_blocks"):
+            for block in unwrapped_dec_pre.gca_blocks.values():
+                block.store_attention = True
 
         with self.accelerator.accumulate(self.encoder, self.decoder):
             memory_key, memory_value, memory_mask = self.encode_context(
@@ -283,6 +352,14 @@ class AwarenessTrainer:
             encoder_grad_norm = self._grad_norm(encoder_params)
             gca_grad_norm = self._grad_norm(decoder_params)
 
+            # Read gate gradients before zero_grad clears them
+            _gate_grads: Dict[str, float] = {}
+            unwrapped_dec = self.accelerator.unwrap_model(self.decoder)
+            if hasattr(unwrapped_dec, "gca_blocks"):
+                for key, block in unwrapped_dec.gca_blocks.items():
+                    if block.gate.grad is not None:
+                        _gate_grads[f"gate_grad/layer_{key}"] = block.gate.grad.abs().item()
+
             if self.accelerator.sync_gradients:
                 params = []
                 for group in self.optimizer.param_groups:
@@ -294,10 +371,23 @@ class AwarenessTrainer:
 
         self.global_step += 1
 
+        # Collect attention diagnostics if enabled for this step
+        _attn_metrics: Dict[str, float] = {}
+        if should_log_attn:
+            _attn_metrics = self._collect_attention_metrics(
+                unwrapped_dec_pre, batch, memory_mask,
+            )
+            # Disable attention storage
+            if hasattr(unwrapped_dec_pre, "gca_blocks"):
+                for block in unwrapped_dec_pre.gca_blocks.values():
+                    block.store_attention = False
+
         metrics: Dict[str, float] = {
             "loss": loss.item(),
+            "perplexity": math.exp(min(loss.item(), 20)),
             "encoder_grad_norm": encoder_grad_norm,
             "gca_grad_norm": gca_grad_norm,
+            "grad_ratio": gca_grad_norm / max(encoder_grad_norm, 1e-8),
         }
 
         unwrapped_decoder = self.accelerator.unwrap_model(self.decoder)
@@ -306,6 +396,15 @@ class AwarenessTrainer:
             metrics.update({f"gate/{k}": v for k, v in gate_values.items()})
             if gate_values:
                 metrics["gate/avg"] = sum(gate_values.values()) / len(gate_values)
+
+        # Gate gradient magnitudes (captured before zero_grad above)
+        if _gate_grads:
+            metrics.update(_gate_grads)
+            metrics["gate_grad/avg"] = sum(_gate_grads.values()) / len(_gate_grads)
+
+        # Attention diagnostics (collected at log intervals)
+        if _attn_metrics:
+            metrics.update(_attn_metrics)
 
         if self.accelerator.is_main_process:
             # Get LRs by name from param groups to avoid index-order assumptions
@@ -316,13 +415,24 @@ class AwarenessTrainer:
 
             log_payload = {
                 "train/loss": metrics["loss"],
+                "train/perplexity": metrics["perplexity"],
                 "train/lr_encoder": lr_by_name.get("encoder", 0.0),
                 "train/lr_gca": lr_by_name.get("gca", 0.0),
                 "train/encoder_grad_norm": encoder_grad_norm,
                 "train/gca_grad_norm": gca_grad_norm,
+                "train/grad_norm_ratio": metrics["grad_ratio"],
             }
             if "gate/avg" in metrics:
                 log_payload["train/gate_avg"] = metrics["gate/avg"]
+            if "gate_grad/avg" in metrics:
+                log_payload["train/gate_grad_avg"] = metrics["gate_grad/avg"]
+                for k, v in metrics.items():
+                    if k.startswith("gate_grad/layer_"):
+                        log_payload[f"train/{k}"] = v
+            if "attn_entropy" in metrics:
+                log_payload["train/attn_entropy"] = metrics["attn_entropy"]
+            if "needle_precision" in metrics:
+                log_payload["train/needle_precision"] = metrics["needle_precision"]
             self.accelerator.log(log_payload, step=self.global_step)
 
         return metrics

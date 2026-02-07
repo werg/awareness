@@ -103,6 +103,10 @@ def evaluate(
     correct = 0
     total = 0
 
+    # Per-category tracking
+    category_correct: dict = {}
+    category_total: dict = {}
+
     logger.info(f"Starting evaluation (max {num_samples} samples)...")
 
     with torch.no_grad():
@@ -140,6 +144,9 @@ def evaluate(
             )
             logger.info(f"  Generation complete")
 
+            # Get template categories for this batch (if available)
+            categories = batch.get("template_category")
+
             # Decode and check accuracy
             for i in range(len(batch["answer_ids"])):
                 answer_mask = batch["answer_mask"][i].bool()
@@ -152,12 +159,24 @@ def evaluate(
                     skip_special_tokens=True,
                 ).lower()
 
-                if expected and expected in generated_text:
+                is_correct = bool(expected and expected in generated_text)
+                if is_correct:
                     correct += 1
                 total += 1
 
+                # Track per-category accuracy
+                if categories is not None and i < len(categories):
+                    cat = categories[i]
+                    category_total[cat] = category_total.get(cat, 0) + 1
+                    category_correct[cat] = category_correct.get(cat, 0) + (1 if is_correct else 0)
+
     accuracy = correct / total if total > 0 else 0
     logger.info(f"Evaluation complete: {correct}/{total} = {accuracy:.2%}")
+
+    # Log per-category accuracy
+    for cat in sorted(category_total.keys()):
+        cat_acc = category_correct.get(cat, 0) / category_total[cat]
+        logger.info(f"  {cat}: {category_correct.get(cat, 0)}/{category_total[cat]} = {cat_acc:.2%}")
 
     gate_values = (
         base_decoder.get_gate_values()
@@ -176,6 +195,10 @@ def evaluate(
         }
         for k, v in gate_values.items():
             log_dict[f"{prefix}/gate/{k}"] = v
+        # Per-category accuracy
+        for cat in category_total:
+            cat_acc = category_correct.get(cat, 0) / category_total[cat]
+            log_dict[f"{prefix}/accuracy/{cat}"] = cat_acc
         accelerator.log(log_dict, step=step)
 
     return {
@@ -183,7 +206,46 @@ def evaluate(
         "correct": correct,
         "total": total,
         "gate_values": gate_values,
+        "category_accuracy": {
+            cat: category_correct.get(cat, 0) / category_total[cat]
+            for cat in category_total
+        },
     }
+
+
+def evaluate_no_memory(
+    decoder: AwarenessDecoder,
+    encoder: ContextEncoder,
+    dataloader: DataLoader,
+    num_samples: int = 50,
+    accelerator=None,
+    step: Optional[int] = None,
+    prefix: str = "eval",
+) -> dict:
+    """
+    Evaluate without cross-attention memory (baseline).
+
+    Removes GCA hooks so the decoder runs as a plain causal LM,
+    then restores them. This measures how much accuracy comes from
+    the model's pretrained knowledge vs. actual memory retrieval.
+    """
+    base_decoder = getattr(decoder, "module", decoder)
+
+    # Remove hooks to disable GCA
+    base_decoder.remove_hooks()
+    try:
+        result = evaluate(
+            decoder, encoder, dataloader,
+            num_samples=num_samples,
+            accelerator=accelerator,
+            step=step,
+            prefix=f"{prefix}_baseline",
+        )
+    finally:
+        # Always restore hooks
+        base_decoder.reregister_hooks()
+
+    return result
 
 
 def build_bitsandbytes_config() -> BitsAndBytesConfig:
@@ -433,16 +495,18 @@ def main():
     logger.info(f"Decoder loaded: {decoder}")
 
     # Create datasets
-    # Use reasonable context length - 5 sentences ~50-100 tokens, use 256 for padding headroom
-    context_chunk_length = 256
+    # Proto-1 is a smoke test — small haystack (4 chunks x 3 sentences) keeps
+    # encoder cost low while still validating retrieval. 3 sentences ~30-60 tokens,
+    # 128 gives padding headroom.
+    context_chunk_length = 128
 
     logger.info("Creating training dataset...")
     train_dataset = NeedleHaystackDataset(
         tokenizer=decoder.tokenizer,
         encoder_tokenizer=encoder.tokenizer,
         num_examples=args.num_train_examples,
-        num_chunks=10,
-        sentences_per_chunk=5,
+        num_chunks=4,
+        sentences_per_chunk=3,
         context_max_length=context_chunk_length,
         seed=args.seed,
     )
@@ -452,8 +516,8 @@ def main():
         tokenizer=decoder.tokenizer,
         encoder_tokenizer=encoder.tokenizer,
         num_examples=args.num_eval_examples,
-        num_chunks=10,
-        sentences_per_chunk=5,
+        num_chunks=4,
+        sentences_per_chunk=3,
         context_max_length=context_chunk_length,
         seed=args.seed + 1,  # Different seed for eval
     )
@@ -569,17 +633,37 @@ def main():
         f"Effective batch: {args.batch_size * args.gradient_accumulation_steps}"
     )
 
+    def run_eval(num_samples, step, prefix):
+        """Run evaluation with memory and baseline, log memory contribution."""
+        accel = trainer.accelerator if use_wandb else None
+        unwrapped_dec = trainer.accelerator.unwrap_model(trainer.decoder)
+        unwrapped_enc = trainer.accelerator.unwrap_model(trainer.encoder)
+
+        metrics = evaluate(
+            unwrapped_dec, unwrapped_enc, eval_loader,
+            num_samples=num_samples,
+            accelerator=accel, step=step, prefix=prefix,
+        )
+
+        baseline = evaluate_no_memory(
+            unwrapped_dec, unwrapped_enc, eval_loader,
+            num_samples=min(num_samples, 50),
+            accelerator=accel, step=step, prefix=prefix,
+        )
+
+        contribution = metrics["accuracy"] - baseline["accuracy"]
+        logger.info(
+            f"Memory contribution: {contribution:+.2%} "
+            f"(with={metrics['accuracy']:.2%}, baseline={baseline['accuracy']:.2%})"
+        )
+        if accel is not None and accel.is_main_process:
+            accel.log({f"{prefix}/memory_contribution": contribution}, step=step)
+
+        return metrics
+
     # Initial evaluation
     logger.info("Initial evaluation...")
-    eval_metrics = evaluate(
-        trainer.accelerator.unwrap_model(trainer.decoder),
-        trainer.accelerator.unwrap_model(trainer.encoder),
-        eval_loader,
-        num_samples=50,
-        accelerator=trainer.accelerator if use_wandb else None,
-        step=0,
-        prefix="initial",
-    )
+    eval_metrics = run_eval(num_samples=50, step=0, prefix="initial")
     logger.info(f"Initial accuracy: {eval_metrics['accuracy']:.2%}")
 
     # Train
@@ -596,14 +680,8 @@ def main():
             f"Avg Gate: {avg_gate:.4f}"
         )
 
-        eval_metrics = evaluate(
-            trainer.accelerator.unwrap_model(trainer.decoder),
-            trainer.accelerator.unwrap_model(trainer.encoder),
-            eval_loader,
-            num_samples=100,
-            accelerator=trainer.accelerator if use_wandb else None,
-            step=trainer.global_step,
-            prefix="eval",
+        eval_metrics = run_eval(
+            num_samples=100, step=trainer.global_step, prefix="eval",
         )
         logger.info(f"Eval accuracy: {eval_metrics['accuracy']:.2%}")
         logger.info(f"Gate values: {eval_metrics['gate_values']}")
@@ -623,12 +701,8 @@ def main():
     logger.info("\n" + "=" * 60)
     logger.info("Final Evaluation")
     logger.info("=" * 60)
-    eval_metrics = evaluate(
-        trainer.accelerator.unwrap_model(trainer.decoder),
-        trainer.accelerator.unwrap_model(trainer.encoder),
-        eval_loader,
+    eval_metrics = run_eval(
         num_samples=args.num_eval_examples,
-        accelerator=trainer.accelerator if use_wandb else None,
         step=trainer.global_step,
         prefix="final",
     )

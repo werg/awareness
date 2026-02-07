@@ -26,6 +26,7 @@ class NeedleHaystackExample:
     needle_text: str  # The actual needle sentence
     question: str  # Question about the needle
     answer: str  # Expected answer
+    template_category: str  # "simple", "entity", or "code"
 
 
 # Filler text templates for generating haystack
@@ -160,9 +161,22 @@ class NeedleHaystackGenerator:
         if seed is not None:
             random.seed(seed)
 
+    # Template index -> category mapping (matches comment blocks in NEEDLE_TEMPLATES)
+    _TEMPLATE_CATEGORIES = (
+        ["simple"] * 5 +   # templates 0-4: simple retrieval
+        ["entity"] * 3 +   # templates 5-7: named entity retrieval
+        ["code"] * 5        # templates 8-12: code-like retrieval
+    )
+
     def _generate_needle(self) -> tuple:
-        """Generate a needle fact with question and answer."""
-        template = random.choice(NEEDLE_TEMPLATES)
+        """Generate a needle fact with question and answer.
+
+        Returns:
+            (statement, question, answer, category) tuple
+        """
+        template_idx = random.randrange(len(NEEDLE_TEMPLATES))
+        template = NEEDLE_TEMPLATES[template_idx]
+        category = self._TEMPLATE_CATEGORIES[template_idx]
         statement_template, question_template, answer_template = template
 
         # Find all placeholders in the templates
@@ -180,7 +194,7 @@ class NeedleHaystackGenerator:
         question = question_template.format(**values)
         answer = answer_template.format(**values)
 
-        return statement, question, answer
+        return statement, question, answer, category
 
     def generate_example(self) -> NeedleHaystackExample:
         """Generate a single training example."""
@@ -191,7 +205,7 @@ class NeedleHaystackGenerator:
         needle_idx = random.randint(0, self.num_chunks - 1)
 
         # Generate needle
-        needle_text, question, answer = self._generate_needle()
+        needle_text, question, answer, category = self._generate_needle()
 
         # Insert needle into chosen chunk (at random position within chunk)
         chunk_sentences = chunks[needle_idx].split(". ")
@@ -205,6 +219,7 @@ class NeedleHaystackGenerator:
             needle_text=needle_text,
             question=question,
             answer=answer,
+            template_category=category,
         )
 
     def generate(self, num_examples: int) -> Iterator[NeedleHaystackExample]:
@@ -317,6 +332,7 @@ class NeedleHaystackDataset(IterableDataset):
             "question_mask": question_tokens["attention_mask"].squeeze(0),
             "answer_ids": answer_tokens["input_ids"].squeeze(0),
             "needle_chunk_idx": torch.tensor(example.needle_chunk_idx, dtype=torch.long),
+            "template_category": example.template_category,
         }
 
 
@@ -365,7 +381,7 @@ def collate_needle_haystack(
     context_attention_mask = torch.stack([item["context_attention_mask"] for item in batch])
     needle_chunk_idx = torch.stack([item["needle_chunk_idx"] for item in batch])
 
-    return {
+    result = {
         "context_input_ids": context_input_ids,
         "context_attention_mask": context_attention_mask,
         "question_ids": question_ids,
@@ -374,3 +390,10 @@ def collate_needle_haystack(
         "answer_mask": answer_mask,
         "needle_chunk_idx": needle_chunk_idx,
     }
+
+    # Pass through template_category as a plain list (not a tensor).
+    # Accelerate's dataloader handles non-tensor values gracefully.
+    if "template_category" in batch[0]:
+        result["template_category"] = [item["template_category"] for item in batch]
+
+    return result
