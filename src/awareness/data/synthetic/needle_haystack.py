@@ -19,7 +19,10 @@ from torch.utils.data import IterableDataset
 
 # Integer encoding for template categories.  Kept at module level so both
 # the dataset __getitem__ and the eval loop can map back and forth.
-CATEGORY_NAMES: List[str] = ["simple", "entity", "code", "lookup"]
+CATEGORY_NAMES: List[str] = [
+    "simple", "entity", "code", "lookup",
+    "temporal", "numeric", "definition", "assertion",
+]
 CATEGORY_TO_IDX: Dict[str, int] = {name: i for i, name in enumerate(CATEGORY_NAMES)}
 
 
