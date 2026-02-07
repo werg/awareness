@@ -1,14 +1,15 @@
 """AwarenessDecoder: Qwen3 decoder with Gated Cross-Attention injection.
 
 This module provides the concrete implementation of the Reasoning Kernel (D_φ)
-using Qwen3 as the backbone. GCA blocks are injected into the upper 1/3 of
-the decoder layers via forward hooks, allowing the model to cross-attend
-to pre-computed encoder memory.
+using Qwen3 as the backbone. GCA blocks are injected into configurable decoder
+layers via forward hooks, allowing the model to cross-attend to pre-computed
+encoder memory.
 
 Key design decisions:
 - Hook-based injection: Clean, no need to subclass Qwen3 internals
 - Gate initialization: Near zero for stable training start
 - RMSNorm before GCA: Follows Qwen3 pre-norm pattern
+- Configurable GCA placement: explicit layer list, or every_n schedule
 """
 
 from contextlib import contextmanager
@@ -18,6 +19,36 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
 from .decoder import GatedCrossAttention
+
+
+def gca_layer_schedule(
+    num_layers: int,
+    every_n: int = 3,
+    start_layer: Optional[int] = None,
+) -> List[int]:
+    """Compute which decoder layers should receive GCA blocks.
+
+    Places a GCA block every ``every_n`` layers starting from ``start_layer``
+    (RETRO-style sparse placement).
+
+    Args:
+        num_layers: Total number of decoder layers.
+        every_n: Spacing between GCA layers.
+        start_layer: First GCA layer index.
+            Defaults to ``num_layers // 3``.
+
+    Returns:
+        Sorted list of layer indices that should have GCA blocks.
+
+    Examples:
+        >>> gca_layer_schedule(28)
+        [9, 12, 15, 18, 21, 24, 27]
+        >>> gca_layer_schedule(28, every_n=3, start_layer=6)
+        [6, 9, 12, 15, 18, 21, 24, 27]
+    """
+    if start_layer is None:
+        start_layer = num_layers // 3
+    return list(range(start_layer, num_layers, every_n))
 
 
 class Float32RMSNorm(nn.Module):
@@ -46,13 +77,17 @@ class Float32RMSNorm(nn.Module):
 
 class AwarenessDecoder(nn.Module):
     """
-    Qwen3 decoder augmented with Gated Cross-Attention in the upper 1/3 of layers.
+    Qwen3 decoder augmented with Gated Cross-Attention at configurable layers.
 
     This wrapper:
     1. Loads a Qwen3 causal LM as the backbone
-    2. Creates GCA blocks for the upper 1/3 of layers
-    3. Registers forward hooks to inject GCA after each self-attention layer
+    2. Creates GCA blocks at the specified layers (default: every 3rd, RETRO-style)
+    3. Registers forward hooks to inject GCA after each designated layer
     4. Provides memory-aware forward and generate methods
+
+    GCA placement can be controlled via ``gca_layers`` (explicit list) or left
+    as ``None`` to use the default every-3rd-layer schedule (RETRO-style).
+    Use :func:`gca_layer_schedule` to compute other patterns.
     """
 
     def __init__(
@@ -67,6 +102,7 @@ class AwarenessDecoder(nn.Module):
         quantization_config: Optional[Any] = None,
         gca_attn_dropout: float = 0.0,
         gca_output_dropout: float = 0.0,
+        gca_layers: Optional[List[int]] = None,
     ):
         """
         Initialize the AwarenessDecoder.
@@ -76,6 +112,11 @@ class AwarenessDecoder(nn.Module):
             device: Device to load model on (None for auto)
             torch_dtype: Data type (None for auto, recommend torch.bfloat16)
             trust_remote_code: Whether to trust remote code for Qwen3
+            gca_attn_dropout: Attention dropout in GCA blocks
+            gca_output_dropout: Output dropout in GCA blocks
+            gca_layers: Explicit list of layer indices to receive GCA blocks.
+                If None, defaults to every 3rd layer from layer num_layers//3
+                (RETRO-style). Use :func:`gca_layer_schedule` for other patterns.
         """
         super().__init__()
 
@@ -117,14 +158,25 @@ class AwarenessDecoder(nn.Module):
         # Determine RMSNorm epsilon (Qwen3 uses rms_norm_eps)
         self.rms_norm_eps = getattr(self.config, "rms_norm_eps", 1e-6)
 
-        # GCA in upper 1/3: for 28 layers, this is layers 19-27 (indices 18-27)
-        self.gca_start_layer = (self.num_layers * 2) // 3
+        # Determine GCA layer placement
+        if gca_layers is not None:
+            self.gca_layer_indices = sorted(gca_layers)
+            # Validate indices
+            for idx in self.gca_layer_indices:
+                if idx < 0 or idx >= self.num_layers:
+                    raise ValueError(
+                        f"GCA layer index {idx} out of range "
+                        f"[0, {self.num_layers})"
+                    )
+        else:
+            # Default: every 3rd layer from ~1/3 into the network (RETRO-style)
+            self.gca_layer_indices = gca_layer_schedule(self.num_layers)
 
-        # Create GCA blocks and their layer norms for upper layers
+        # Create GCA blocks and their layer norms
         self.gca_blocks = nn.ModuleDict()
         self.gca_norms = nn.ModuleDict()
 
-        for i in range(self.gca_start_layer, self.num_layers):
+        for i in self.gca_layer_indices:
             layer_key = str(i)
             self.gca_blocks[layer_key] = GatedCrossAttention(
                 hidden_size=self.hidden_size,
@@ -177,7 +229,7 @@ class AwarenessDecoder(nn.Module):
         # Access the decoder layers (Qwen3 structure: model.model.layers)
         decoder_layers = self.model.model.layers
 
-        for i in range(self.gca_start_layer, self.num_layers):
+        for i in self.gca_layer_indices:
             layer = decoder_layers[i]
             hook = layer.register_forward_hook(self._make_gca_hook(i))
             self._hooks.append(hook)
@@ -418,11 +470,16 @@ class AwarenessDecoder(nn.Module):
         self._register_hooks()
 
     def __repr__(self) -> str:
+        layers = self.gca_layer_indices
+        if layers == list(range(layers[0], layers[-1] + 1)):
+            layer_str = f"{layers[0]}-{layers[-1]}"
+        else:
+            layer_str = str(layers)
         return (
             f"AwarenessDecoder(\n"
             f"  model={self.model.config._name_or_path},\n"
             f"  num_layers={self.num_layers},\n"
-            f"  gca_layers={self.gca_start_layer}-{self.num_layers - 1},\n"
+            f"  gca_layers={layer_str} ({len(layers)} blocks),\n"
             f"  hidden_size={self.hidden_size},\n"
             f"  num_heads={self.num_heads},\n"
             f"  num_kv_heads={self.num_kv_heads}\n"

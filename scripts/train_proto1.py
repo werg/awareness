@@ -48,7 +48,7 @@ except ImportError:  # pragma: no cover - optional dependency
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from awareness.models.encoder import ContextEncoder
-from awareness.models.awareness_decoder import AwarenessDecoder
+from awareness.models.awareness_decoder import AwarenessDecoder, gca_layer_schedule
 from awareness.data.synthetic.needle_haystack import (
     NeedleHaystackDataset,
     collate_needle_haystack,
@@ -359,6 +359,7 @@ def load_decoder(
     bnb_config: Optional[BitsAndBytesConfig],
     gca_attn_dropout: float = 0.0,
     gca_output_dropout: float = 0.0,
+    gca_layers: Optional[list] = None,
 ) -> AwarenessDecoder:
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     return AwarenessDecoder(
@@ -368,6 +369,7 @@ def load_decoder(
         quantization_config=bnb_config if quantize else None,
         gca_attn_dropout=gca_attn_dropout,
         gca_output_dropout=gca_output_dropout,
+        gca_layers=gca_layers,
     )
 
 
@@ -533,6 +535,24 @@ def main():
         help="Output dropout in GCA blocks (before gated residual)",
     )
     parser.add_argument(
+        "--gca-every-n",
+        type=int,
+        default=3,
+        help="Spacing for 'every_n' GCA strategy (default: 3, RETRO-style)",
+    )
+    parser.add_argument(
+        "--gca-start-layer",
+        type=int,
+        default=None,
+        help="First GCA layer for 'every_n' strategy (default: num_layers // 3)",
+    )
+    parser.add_argument(
+        "--gca-layers",
+        type=str,
+        default=None,
+        help="Explicit comma-separated GCA layer indices (overrides --gca-strategy)",
+    )
+    parser.add_argument(
         "--curriculum",
         action="store_true",
         help="Enable context size curriculum (ramp chunk count during training)",
@@ -579,6 +599,18 @@ def main():
     )
     logger.info(f"Encoder loaded: {encoder}")
 
+    # Compute GCA layer placement
+    if args.gca_layers is not None:
+        gca_layers = [int(x.strip()) for x in args.gca_layers.split(",")]
+    else:
+        from transformers import AutoConfig as _AC
+        _cfg = _AC.from_pretrained(args.decoder_model, trust_remote_code=True)
+        gca_layers = gca_layer_schedule(
+            _cfg.num_hidden_layers,
+            every_n=args.gca_every_n,
+            start_layer=args.gca_start_layer,
+        )
+
     logger.info("Loading decoder with GCA...")
     decoder = load_decoder(
         model_name=args.decoder_model,
@@ -586,8 +618,10 @@ def main():
         bnb_config=bnb_config,
         gca_attn_dropout=args.gca_attn_dropout,
         gca_output_dropout=args.gca_output_dropout,
+        gca_layers=gca_layers,
     )
     logger.info(f"Decoder loaded: {decoder}")
+    logger.info(f"GCA layers: {decoder.gca_layer_indices}")
     logger.info(f"GCA dropout: attn={args.gca_attn_dropout}, output={args.gca_output_dropout}")
 
     # Create datasets
@@ -728,6 +762,8 @@ def main():
         "dataset": args.dataset,
         "gca_attn_dropout": args.gca_attn_dropout,
         "gca_output_dropout": args.gca_output_dropout,
+        "gca_layers": str(decoder.gca_layer_indices),
+        "gca_num_blocks": len(decoder.gca_layer_indices),
         "curriculum": args.curriculum,
     }
 

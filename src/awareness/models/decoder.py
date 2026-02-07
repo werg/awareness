@@ -2,7 +2,7 @@
 
 From PLAN.md Section 2.3:
 - Base Architecture: Standard Causal Self-Attention (CSA) handles immediate instruction
-- Augmentation: In upper 1/3 of network, CSA blocks are interleaved with GCA blocks
+- Augmentation: CSA blocks are interleaved with GCA blocks (default: every 3rd layer)
 - Mechanism: Attention(Q, K, V) = softmax(Q_loc @ K_mem^T / sqrt(d_k)) @ V_mem
   - Q_loc: Queries from Decoder's current prompt
   - K_mem, V_mem: Pre-computed tensors fetched from Memory Store
@@ -185,7 +185,7 @@ class ReasoningDecoder(nn.Module):
     The Reasoning Kernel / Decoder (D_φ) - Abstract base class.
 
     A decoder-only LLM augmented with Gated Cross-Attention blocks
-    in the upper 1/3 of the network.
+    at configurable layers (default: every 3rd layer, RETRO-style).
 
     See AwarenessDecoder for the concrete Qwen3-based implementation.
     """
@@ -202,7 +202,8 @@ class ReasoningDecoder(nn.Module):
         self.num_layers = num_layers
         self.num_heads = num_heads
 
-        # GCA applied to upper 1/3 of network (per PLAN.md)
+        # Default GCA placement: upper 1/3 of network
+        # Concrete implementations (AwarenessDecoder) support configurable placement
         self.gca_start_layer = num_layers * 2 // 3
 
     def forward(
