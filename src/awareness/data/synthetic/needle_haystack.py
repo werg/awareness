@@ -74,20 +74,23 @@ LOCATIONS = [
     "ocean", "river", "garden", "castle", "tower", "cave",
 ]
 
-HARD_NEGATIVE_TEMPLATES = [
-    "The secret code was changed last Tuesday.",
-    "The password policy requires at least 8 characters.",
-    "Function results depend on the input parameters.",
-    "The capital was moved to a new location in 1960.",
-    "Variable x is defined somewhere in the module.",
-    "The config has been updated to reflect new values.",
-    "Class inheritance was restructured in the latest release.",
-    "The method signature was deprecated in version 2.0.",
-    "Error handling was improved across the codebase.",
-    "The deadline was extended by the project manager.",
-    "Population statistics are updated annually.",
-    "The term was redefined in the latest specification.",
-]
+def _generate_hard_negative() -> str:
+    """Generate a hard-negative filler sentence.
+
+    Picks a random needle template and fills it with fresh random values,
+    producing a distractor that is structurally identical to a real needle.
+    The model must learn to attend to the *specific* needle matching the
+    question rather than just "anything that looks like a fact."
+    """
+    # Import lazily to avoid circular ref at module level
+    tpl = random.choice(NEEDLE_TEMPLATES)
+    statement_template = tpl[0]
+    placeholders = set(re.findall(r"\{(\w+)\}", statement_template))
+    values = {
+        ph: VALUE_GENERATORS.get(ph, VALUE_GENERATORS["value"])()
+        for ph in placeholders
+    }
+    return statement_template.format(**values)
 
 # ---------------------------------------------------------------------------
 # Procedural value generation helpers
@@ -174,7 +177,16 @@ VALUE_GENERATORS = {
     "person": lambda: _random_name(),
     "company": lambda: _random_word(capitalize=True) + random.choice(["Corp", "Inc", "Labs", "Tech", "AI"]),
     "func": lambda: _random_identifier(),
-    "ret": lambda: random.choice(["True", "False", "None", str(random.randint(-100, 100)), "[]", "{}", '""', "0.0"]),
+    "ret": lambda: random.choice([
+        "True", "False", "None",
+        str(random.randint(-9999, 9999)),
+        f"[{random.randint(0, 99)}, {random.randint(0, 99)}]",
+        f'{{"key": {random.randint(0, 99)}}}',
+        f'"{_random_word()}"',
+        f"({random.randint(0,99)}, {random.randint(0,99)})",
+        f"{random.uniform(-100, 100):.2f}",
+        f"0x{random.randint(0, 0xFFFF):04X}",
+    ]),
     "var": lambda: _random_identifier(style="snake"),
     "key": lambda: _random_identifier(style="snake"),
     "cls": lambda: _random_word(capitalize=True) + random.choice(["Handler", "Manager", "Service", "Provider", "Factory"]),
@@ -206,11 +218,15 @@ def generate_filler_sentence() -> str:
 
 
 def generate_filler_chunk(num_sentences: int = 5) -> str:
-    """Generate a chunk of filler text, mixing in hard negatives ~20% of the time."""
+    """Generate a chunk of filler text, mixing in hard negatives ~20% of the time.
+
+    Hard negatives are procedurally generated from needle templates with fresh
+    random values, forcing the model to discriminate based on content, not format.
+    """
     sentences = []
     for _ in range(num_sentences):
         if random.random() < 0.2:
-            sentences.append(random.choice(HARD_NEGATIVE_TEMPLATES))
+            sentences.append(_generate_hard_negative())
         else:
             sentences.append(generate_filler_sentence())
     return " ".join(sentences)

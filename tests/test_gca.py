@@ -409,19 +409,32 @@ class TestNeedleHaystackData:
         )
 
     def test_hard_negatives_in_filler(self):
-        """Test that filler chunks contain hard negatives at expected rate."""
-        from awareness.data.synthetic.needle_haystack import (
-            generate_filler_chunk,
-            HARD_NEGATIVE_TEMPLATES,
-        )
+        """Test that filler chunks contain procedural hard negatives.
+
+        Hard negatives are generated from needle templates with fresh random
+        values, so we detect them by looking for needle-template keywords
+        that would never appear in the regular filler templates.
+        """
+        from awareness.data.synthetic.needle_haystack import generate_filler_chunk
 
         random.seed(42)
-        num_samples = 50
+        # Needle-template phrases that don't overlap with filler vocabulary
+        needle_markers = [
+            "secret code is", "password is", "magic number is",
+            "key phrase is", "capital of", "president of",
+            "founder of", "Function ", "Variable ", "config value for",
+            "Class ", "Method ", "event on", "deadline for",
+            "population of", "items in", "lines.", "dependency ",
+            "Error code", "term ", "abbreviation ", "It is true",
+            "It is false",
+        ]
+
+        num_samples = 200
         hard_neg_count = 0
 
         for _ in range(num_samples):
             chunk = generate_filler_chunk(num_sentences=5)
-            if any(template in chunk for template in HARD_NEGATIVE_TEMPLATES):
+            if any(marker in chunk for marker in needle_markers):
                 hard_neg_count += 1
 
         rate = hard_neg_count / num_samples
