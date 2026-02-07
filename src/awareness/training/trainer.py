@@ -111,6 +111,12 @@ class AwarenessTrainer:
         self.global_step = 0
         self.epoch = 0
 
+        # Step-based base-layer unfreezing (configured via configure_unfreeze)
+        self._unfreeze_after_step: Optional[int] = None
+        self._unfreeze_from_layer: Optional[int] = None
+        self._unfreeze_lr: float = 1e-5
+        self._base_unfrozen: bool = False
+
         loggers: Optional[List[str]]
         if log_with is None:
             loggers = None
@@ -201,6 +207,54 @@ class AwarenessTrainer:
 
         self.accelerator.print(
             f"✓ Verified {hook_count} GCA hooks active after prepare()"
+        )
+
+    def configure_unfreeze(
+        self,
+        after_step: int,
+        from_layer: int,
+        lr: float = 1e-5,
+    ):
+        """Schedule base-layer unfreezing at a specific training step.
+
+        Args:
+            after_step: Unfreeze when global_step reaches this value.
+            from_layer: First decoder layer index to unfreeze.
+            lr: Learning rate for newly unfrozen base parameters.
+        """
+        self._unfreeze_after_step = after_step
+        self._unfreeze_from_layer = from_layer
+        self._unfreeze_lr = lr
+        self.accelerator.print(
+            f"Scheduled base-layer unfreeze at step {after_step} "
+            f"(layers {from_layer}+, lr={lr})"
+        )
+
+    def _maybe_unfreeze(self):
+        """Check if it's time to unfreeze base layers (called each step)."""
+        if self._base_unfrozen or self._unfreeze_after_step is None:
+            return
+        if self.global_step < self._unfreeze_after_step:
+            return
+
+        self._base_unfrozen = True
+        unwrapped = self.accelerator.unwrap_model(self.decoder)
+        if not hasattr(unwrapped, "unfreeze_base_layers"):
+            raise TypeError("Decoder does not support unfreeze_base_layers")
+
+        new_params = unwrapped.unfreeze_base_layers(self._unfreeze_from_layer)
+        if not new_params:
+            self.accelerator.print("No new parameters to unfreeze.")
+            return
+
+        self.optimizer.add_param_group({
+            "params": new_params,
+            "lr": self._unfreeze_lr,
+            "name": "base_layers",
+        })
+        self.accelerator.print(
+            f"Step {self.global_step}: unfroze {len(new_params)} base model params "
+            f"from layer {self._unfreeze_from_layer}, lr={self._unfreeze_lr}"
         )
 
     def encode_context(
@@ -385,6 +439,7 @@ class AwarenessTrainer:
                 self.optimizer.zero_grad()
 
         self.global_step += 1
+        self._maybe_unfreeze()
 
         # Collect attention diagnostics if enabled for this step
         _attn_metrics: Dict[str, float] = {}

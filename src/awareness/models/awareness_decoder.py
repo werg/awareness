@@ -430,6 +430,29 @@ class AwarenessDecoder(nn.Module):
         for param in self.model.parameters():
             param.requires_grad = True
 
+    def unfreeze_base_layers(self, from_layer: int) -> List[nn.Parameter]:
+        """Unfreeze base model layers from ``from_layer`` to the end.
+
+        The final layer norm and LM head are kept frozen to preserve the
+        model's output distribution and avoid overfitting to synthetic data.
+
+        Args:
+            from_layer: First layer index to unfreeze (inclusive).
+
+        Returns:
+            List of newly unfrozen parameters (for adding to an optimizer).
+        """
+        decoder_layers = self.model.model.layers
+        params: List[nn.Parameter] = []
+
+        for i in range(from_layer, self.num_layers):
+            for p in decoder_layers[i].parameters():
+                if not p.requires_grad:
+                    p.requires_grad = True
+                    params.append(p)
+
+        return params
+
     def remove_hooks(self):
         """Remove all forward hooks (useful for cleanup or baseline comparison)."""
         for hook in self._hooks:

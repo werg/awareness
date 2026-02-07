@@ -485,8 +485,8 @@ def main():
     parser.add_argument(
         "--gradient-accumulation-steps",
         type=int,
-        default=1,
-        help="Accelerate gradient accumulation steps",
+        default=4,
+        help="Accelerate gradient accumulation steps (effective batch = batch_size * this)",
     )
     parser.add_argument(
         "--mixed-precision",
@@ -570,6 +570,26 @@ def main():
         type=int,
         default=20,
         help="Maximum chunks for curriculum (end of training)",
+    )
+    parser.add_argument(
+        "--unfreeze-after-step",
+        type=int,
+        default=1000,
+        help="Unfreeze base decoder layers after this many optimizer steps. "
+             "Set to 0 to disable. "
+             "Enables two-phase training: frozen-base GCA-only, then joint fine-tuning.",
+    )
+    parser.add_argument(
+        "--unfreeze-from-layer",
+        type=int,
+        default=None,
+        help="First base layer to unfreeze (default: 2 layers before first GCA layer)",
+    )
+    parser.add_argument(
+        "--base-lr",
+        type=float,
+        default=1e-5,
+        help="Learning rate for unfrozen base model layers",
     )
 
     args = parser.parse_args()
@@ -866,6 +886,18 @@ def main():
     logger.info("Initial evaluation...")
     eval_metrics = run_eval(num_samples=50, step=0, prefix="initial")
     logger.info(f"Initial accuracy: {eval_metrics['accuracy']:.2%}")
+
+    # Configure step-based unfreeze (0 disables)
+    if args.unfreeze_after_step and args.unfreeze_after_step > 0:
+        unfreeze_from = args.unfreeze_from_layer
+        if unfreeze_from is None:
+            first_gca = min(decoder.gca_layer_indices)
+            unfreeze_from = max(0, first_gca - 2)
+        trainer.configure_unfreeze(
+            after_step=args.unfreeze_after_step,
+            from_layer=unfreeze_from,
+            lr=args.base_lr,
+        )
 
     # Train
     for epoch in range(args.num_epochs):
