@@ -62,7 +62,24 @@ class GatedCrossAttention(nn.Module):
         # This breaks the chicken-and-egg deadlock: projections receive ~27% of
         # full gradient (vs ~1.8% at -4), letting them learn useful patterns
         # which in turn gives the gate a consistent signal to grow.
+        #
+        # NOTE: gate is ALWAYS kept in float32 (see _apply override) because
+        # bfloat16 ULP near -1.0 is ~0.008, which swallows AdamW updates of ~1e-4.
         self.gate = nn.Parameter(torch.tensor([-1.0]))
+
+        # Attention diagnostics (off by default for performance)
+        self.store_attention = False
+        self._last_attn_weights: Optional[torch.Tensor] = None
+
+    def _apply(self, fn):
+        """Keep gate in float32 through dtype conversions (.to(), .bfloat16(), etc.).
+
+        bfloat16 has ~0.008 ULP near typical gate values, which is larger than
+        AdamW updates (~1e-4), so the gate would never change in bfloat16.
+        """
+        super()._apply(fn)
+        self.gate.data = self.gate.data.float()
+        return self
 
     def forward(
         self,
@@ -122,6 +139,10 @@ class GatedCrossAttention(nn.Module):
         # (Standard HuggingFace pattern from Llama, Mistral, etc.)
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
 
+        # Optionally store attention weights for diagnostics
+        if self.store_attention:
+            self._last_attn_weights = attn_weights.detach()
+
         # Attend to values
         # attn_output: [batch, num_heads, seq_len, head_dim]
         attn_output = torch.matmul(attn_weights, v)
@@ -136,7 +157,8 @@ class GatedCrossAttention(nn.Module):
         # Gated residual connection
         # Gate uses sigmoid, bounded to (0, 1) representing fraction of memory to use
         # Residual adds to original (pre-norm) hidden states, not the normed version
-        gate_value = torch.sigmoid(self.gate)
+        # Cast gate to computation dtype (gate is kept in float32 for optimizer precision)
+        gate_value = torch.sigmoid(self.gate).to(dtype=attn_output.dtype)
         base = residual if residual is not None else hidden_states
         return base + gate_value * attn_output
 

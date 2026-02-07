@@ -143,6 +143,24 @@ class AwarenessDecoder(nn.Module):
         for norm in self.gca_norms.values():
             norm.to(device=device, dtype=dtype)
 
+        self._keep_norms_float32()
+
+    def _keep_norms_float32(self):
+        """Keep RMSNorm gains in float32 for optimizer precision.
+
+        RMSNorm weight is initialized to 1.0. bfloat16 ULP at 1.0 is ~0.008,
+        which swallows AdamW updates of ~1e-4, freezing the gains.
+        """
+        for norm in self.gca_norms.values():
+            if hasattr(norm, "weight") and norm.weight is not None:
+                norm.weight.data = norm.weight.data.float()
+
+    def _apply(self, fn):
+        """Preserve float32 on GCA norms through dtype conversions."""
+        super()._apply(fn)
+        self._keep_norms_float32()
+        return self
+
     def _register_hooks(self):
         """Register forward hooks on decoder layers to inject GCA."""
         # Access the decoder layers (Qwen3 structure: model.model.layers)
