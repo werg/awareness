@@ -40,7 +40,7 @@ class ContextEncoder(nn.Module):
         trust_remote_code: bool = True,
         quantization_config: Optional[Any] = None,
         max_length: int = 8192,
-        kv_projection: bool = True,
+        kv_projection: bool = False,
         kv_hidden_size: Optional[int] = None,
     ):
         """

@@ -33,12 +33,16 @@ class GatedCrossAttention(nn.Module):
         hidden_size: int,
         num_heads: int,
         num_kv_heads: Optional[int] = None,
+        attn_dropout: float = 0.0,
+        output_dropout: float = 0.0,
     ):
         """
         Args:
             hidden_size: Model hidden dimension
             num_heads: Number of query attention heads
             num_kv_heads: Number of key/value heads (for GQA). Defaults to num_heads.
+            attn_dropout: Dropout probability on attention weights (after softmax)
+            output_dropout: Dropout probability on output (before gated residual)
         """
         super().__init__()
         self.hidden_size = hidden_size
@@ -55,6 +59,11 @@ class GatedCrossAttention(nn.Module):
 
         # Output projection
         self.o_proj = nn.Linear(num_heads * self.head_dim, hidden_size, bias=False)
+
+        # Dropout layers
+        self.attn_dropout_p = attn_dropout
+        self.attn_dropout_layer = nn.Dropout(attn_dropout)
+        self.output_dropout_layer = nn.Dropout(output_dropout)
 
         # Learnable gate (initialized so projections get meaningful gradients)
         # Using sigmoid to bound in (0, 1) - represents fraction of memory to incorporate
@@ -127,32 +136,40 @@ class GatedCrossAttention(nn.Module):
             k = k.repeat_interleave(n_rep, dim=1)
             v = v.repeat_interleave(n_rep, dim=1)
 
-        # Scaled dot-product attention
-        # attn_weights: [batch, num_heads, seq_len, mem_len]
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-
-        # Apply memory mask if provided (e.g., for padding)
-        if memory_mask is not None:
-            attn_weights = attn_weights + memory_mask
-
-        # Softmax in float32 for numerical stability, then cast back to query dtype
-        # (Standard HuggingFace pattern from Llama, Mistral, etc.)
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
-
-        # Optionally store attention weights for diagnostics
+        # Cross-attention: two paths
+        # 1. Manual path (when store_attention=True): returns attention weights for diagnostics
+        # 2. SDPA path (default): uses FlashAttention/xFormers kernel when available
         if self.store_attention:
+            # Manual scaled dot-product attention (for diagnostics)
+            attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+            if memory_mask is not None:
+                attn_weights = attn_weights + memory_mask
+
+            # Softmax in float32 for numerical stability (HuggingFace pattern)
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+
             self._last_attn_weights = attn_weights.detach()
 
-        # Attend to values
-        # attn_output: [batch, num_heads, seq_len, head_dim]
-        attn_output = torch.matmul(attn_weights, v)
+            attn_weights = self.attn_dropout_layer(attn_weights)
+            attn_output = torch.matmul(attn_weights, v)
+        else:
+            # SDPA path: fused FlashAttention/xFormers when available
+            dropout_p = self.attn_dropout_p if self.training else 0.0
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=memory_mask,
+                dropout_p=dropout_p,
+                is_causal=False,
+            )
 
         # Reshape back to [batch, seq_len, hidden]
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(batch_size, seq_len, -1)
 
-        # Output projection
+        # Output projection + dropout
         attn_output = self.o_proj(attn_output)
+        attn_output = self.output_dropout_layer(attn_output)
 
         # Gated residual connection
         # Gate uses sigmoid, bounded to (0, 1) representing fraction of memory to use

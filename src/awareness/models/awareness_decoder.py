@@ -41,6 +41,8 @@ class AwarenessDecoder(nn.Module):
         torch_dtype: Optional[torch.dtype] = None,
         trust_remote_code: bool = True,
         quantization_config: Optional[Any] = None,
+        gca_attn_dropout: float = 0.0,
+        gca_output_dropout: float = 0.0,
     ):
         """
         Initialize the AwarenessDecoder.
@@ -104,6 +106,8 @@ class AwarenessDecoder(nn.Module):
                 hidden_size=self.hidden_size,
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
+                attn_dropout=gca_attn_dropout,
+                output_dropout=gca_output_dropout,
             )
             # Use RMSNorm like Qwen3 (pre-norm architecture)
             self.gca_norms[layer_key] = nn.RMSNorm(
