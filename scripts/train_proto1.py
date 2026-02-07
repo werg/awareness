@@ -50,6 +50,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from awareness.models.encoder import ContextEncoder
 from awareness.models.awareness_decoder import AwarenessDecoder, gca_layer_schedule
 from awareness.data.synthetic.needle_haystack import (
+    CATEGORY_NAMES,
     NeedleHaystackDataset,
     collate_needle_haystack,
 )
@@ -190,7 +191,8 @@ def evaluate(
                 # Track per-category accuracy
                 cat = None
                 if categories is not None and i < len(categories):
-                    cat = categories[i]
+                    cat_idx = categories[i].item() if torch.is_tensor(categories[i]) else categories[i]
+                    cat = CATEGORY_NAMES[cat_idx] if isinstance(cat_idx, int) else cat_idx
                     category_total[cat] = category_total.get(cat, 0) + 1
                     category_exact[cat] = category_exact.get(cat, 0) + (1 if is_exact else 0)
                     category_substring[cat] = category_substring.get(cat, 0) + (1 if is_substring else 0)

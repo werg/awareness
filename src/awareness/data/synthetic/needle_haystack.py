@@ -17,6 +17,11 @@ from typing import List, Iterator, Optional, Dict, Any, Callable
 import torch
 from torch.utils.data import IterableDataset
 
+# Integer encoding for template categories.  Kept at module level so both
+# the dataset __getitem__ and the eval loop can map back and forth.
+CATEGORY_NAMES: List[str] = ["simple", "entity", "code", "lookup"]
+CATEGORY_TO_IDX: Dict[str, int] = {name: i for i, name in enumerate(CATEGORY_NAMES)}
+
 
 @dataclass
 class NeedleHaystackExample:
@@ -432,7 +437,9 @@ class NeedleHaystackDataset(IterableDataset):
             "question_mask": question_tokens["attention_mask"].squeeze(0),
             "answer_ids": answer_tokens["input_ids"].squeeze(0),
             "needle_chunk_idx": torch.tensor(example.needle_chunk_idx, dtype=torch.long),
-            "template_category": example.template_category,
+            "template_category": torch.tensor(
+                CATEGORY_TO_IDX.get(example.template_category, 0), dtype=torch.long
+            ),
         }
 
 
@@ -511,9 +518,7 @@ def collate_needle_haystack(
         "needle_chunk_idx": needle_chunk_idx,
     }
 
-    # Pass through template_category as a plain list (not a tensor).
-    # Accelerate's dataloader handles non-tensor values gracefully.
     if "template_category" in batch[0]:
-        result["template_category"] = [item["template_category"] for item in batch]
+        result["template_category"] = torch.stack([item["template_category"] for item in batch])
 
     return result

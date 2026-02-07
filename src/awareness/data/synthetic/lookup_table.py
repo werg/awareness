@@ -28,6 +28,7 @@ import torch
 from torch.utils.data import IterableDataset
 
 from awareness.data.synthetic.needle_haystack import (
+    CATEGORY_TO_IDX,
     generate_filler_sentence,
 )
 
@@ -347,5 +348,7 @@ class LookupTableDataset(IterableDataset):
             "needle_chunk_idx": torch.tensor(
                 example.needle_chunk_idx, dtype=torch.long
             ),
-            "template_category": example.template_category,
+            "template_category": torch.tensor(
+                CATEGORY_TO_IDX.get(example.template_category, 0), dtype=torch.long
+            ),
         }
