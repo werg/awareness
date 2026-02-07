@@ -10,9 +10,10 @@ by attending to the correct chunk via cross-attention.
 """
 
 import random
+import re
 import string
 from dataclasses import dataclass
-from typing import List, Iterator, Optional, Dict, Any
+from typing import List, Iterator, Optional, Dict, Any, Callable
 import torch
 from torch.utils.data import IterableDataset
 
@@ -65,44 +66,120 @@ LOCATIONS = [
     "ocean", "river", "garden", "castle", "tower", "cave",
 ]
 
-# Needle fact templates: (statement, question, answer_key)
+HARD_NEGATIVE_TEMPLATES = [
+    "The secret code was changed last Tuesday.",
+    "The password policy requires at least 8 characters.",
+    "Function results depend on the input parameters.",
+    "The capital was moved to a new location in 1960.",
+    "Variable x is defined somewhere in the module.",
+    "The config has been updated to reflect new values.",
+    "Class inheritance was restructured in the latest release.",
+    "The method signature was deprecated in version 2.0.",
+    "Error handling was improved across the codebase.",
+    "The deadline was extended by the project manager.",
+    "Population statistics are updated annually.",
+    "The term was redefined in the latest specification.",
+]
+
+# ---------------------------------------------------------------------------
+# Procedural value generation helpers
+# ---------------------------------------------------------------------------
+
+def _random_word(capitalize=False, min_len=4, max_len=8):
+    """Generate a pronounceable random word (alternating consonants/vowels)."""
+    consonants = "bcdfghjklmnpqrstvwxyz"
+    vowels = "aeiou"
+    length = random.randint(min_len, max_len)
+    word = ""
+    for i in range(length):
+        word += random.choice(consonants if i % 2 == 0 else vowels)
+    return word.capitalize() if capitalize else word
+
+def _random_identifier(style="camel"):
+    """Generate a random function/variable identifier."""
+    words = [_random_word(min_len=3, max_len=6) for _ in range(random.randint(1, 3))]
+    if style == "snake":
+        return "_".join(words)
+    return words[0] + "".join(w.capitalize() for w in words[1:])
+
+def _random_name():
+    """Generate a random first name (pronounceable)."""
+    return _random_word(capitalize=True, min_len=3, max_len=7)
+
+def _random_date():
+    """Generate a random date string."""
+    year = random.randint(1950, 2025)
+    month = random.randint(1, 12)
+    day = random.randint(1, 28)
+    return f"{year}-{month:02d}-{day:02d}"
+
+
+# Needle fact templates: (statement, question, answer_key, category)
 # {value} will be filled with a random value that becomes the answer
 NEEDLE_TEMPLATES = [
     # Simple retrieval
-    ("The secret code is {value}.", "What is the secret code?", "{value}"),
-    ("The password is {value}.", "What is the password?", "{value}"),
-    ("The magic number is {value}.", "What is the magic number?", "{value}"),
-    ("The key phrase is {value}.", "What is the key phrase?", "{value}"),
-    ("The answer to everything is {value}.", "What is the answer to everything?", "{value}"),
+    ("The secret code is {value}.", "What is the secret code?", "{value}", "simple"),
+    ("The password is {value}.", "What is the password?", "{value}", "simple"),
+    ("The magic number is {value}.", "What is the magic number?", "{value}", "simple"),
+    ("The key phrase is {value}.", "What is the key phrase?", "{value}", "simple"),
+    ("The answer to everything is {value}.", "What is the answer to everything?", "{value}", "simple"),
 
     # Named entity retrieval
-    ("The capital of {country} is {city}.", "What is the capital of {country}?", "{city}"),
-    ("The president of {country} is {person}.", "Who is the president of {country}?", "{person}"),
-    ("The founder of {company} is {person}.", "Who founded {company}?", "{person}"),
+    ("The capital of {country} is {city}.", "What is the capital of {country}?", "{city}", "entity"),
+    ("The president of {country} is {person}.", "Who is the president of {country}?", "{person}", "entity"),
+    ("The founder of {company} is {person}.", "Who founded {company}?", "{person}", "entity"),
 
     # Code-like retrieval (preparing for coding tasks)
-    ("Function {func} returns {ret}.", "What does function {func} return?", "{ret}"),
-    ("Variable {var} is set to {value}.", "What is the value of variable {var}?", "{value}"),
-    ("The config value for {key} is {value}.", "What is the config value for {key}?", "{value}"),
-    ("Class {cls} inherits from {parent}.", "What does class {cls} inherit from?", "{parent}"),
-    ("Method {method} takes {params} as parameters.", "What parameters does method {method} take?", "{params}"),
+    ("Function {func} returns {ret}.", "What does function {func} return?", "{ret}", "code"),
+    ("Variable {var} is set to {value}.", "What is the value of variable {var}?", "{value}", "code"),
+    ("The config value for {key} is {value}.", "What is the config value for {key}?", "{value}", "code"),
+    ("Class {cls} inherits from {parent}.", "What does class {cls} inherit from?", "{parent}", "code"),
+    ("Method {method} takes {params} as parameters.", "What parameters does method {method} take?", "{params}", "code"),
+
+    # Temporal retrieval
+    ("The event on {date} was {value}.", "What event happened on {date}?", "{value}", "temporal"),
+    ("The deadline for project {value} is {date}.", "When is the deadline for project {value}?", "{date}", "temporal"),
+
+    # Numeric retrieval
+    ("The population of {city} is {number}.", "What is the population of {city}?", "{number}", "numeric"),
+    ("There are {number} items in {value}.", "How many items are in {value}?", "{number}", "numeric"),
+    ("File {filename} has {number} lines.", "How many lines does file {filename} have?", "{number}", "numeric"),
+
+    # Code additions
+    ("The dependency {value} requires version {version}.", "What version does {value} require?", "{version}", "code"),
+    ("Error code {value} means {description}.", "What does error code {value} mean?", "{description}", "code"),
+
+    # Definition retrieval
+    ("The term {value} refers to {description}.", "What does the term {value} refer to?", "{description}", "definition"),
+    ("The abbreviation {value} stands for {description}.", "What does {value} stand for?", "{description}", "definition"),
+
+    # Assertion retrieval
+    ("It is {bool_val} that {value} supports {feature}.", "Does {value} support {feature}?", "{bool_val}", "assertion"),
+    ("It is {bool_val} that {cls} implements {method}.", "Does {cls} implement {method}?", "{bool_val}", "assertion"),
 ]
 
 # Value generators for different placeholder types
 VALUE_GENERATORS = {
-    "value": lambda: "".join(random.choices(string.ascii_uppercase + string.digits, k=6)),
-    "city": lambda: random.choice(["Paris", "London", "Tokyo", "Berlin", "Rome", "Madrid", "Vienna", "Prague"]),
-    "country": lambda: random.choice(["France", "England", "Japan", "Germany", "Italy", "Spain", "Austria", "Czechia"]),
-    "person": lambda: random.choice(["Alice", "Bob", "Charlie", "Diana", "Edward", "Fiona", "George", "Helen"]),
-    "company": lambda: random.choice(["Acme", "Globex", "Initech", "Umbrella", "Waystar", "Hooli", "Pied Piper"]),
-    "func": lambda: random.choice(["calculate", "process", "validate", "transform", "parse", "encode", "decode"]),
-    "ret": lambda: random.choice(["True", "False", "None", "0", "1", "-1", "[]", "{}"]),
-    "var": lambda: random.choice(["count", "total", "index", "result", "status", "flag", "mode"]),
-    "key": lambda: random.choice(["debug", "timeout", "max_retries", "batch_size", "threshold", "limit"]),
-    "cls": lambda: random.choice(["Handler", "Manager", "Service", "Controller", "Factory", "Builder"]),
-    "parent": lambda: random.choice(["BaseClass", "Object", "Component", "Module", "Interface"]),
-    "method": lambda: random.choice(["initialize", "execute", "cleanup", "update", "render", "fetch"]),
-    "params": lambda: random.choice(["x, y", "data", "config", "options", "args, kwargs", "input, output"]),
+    "value": lambda: ''.join(random.choices(string.ascii_uppercase + string.digits, k=random.randint(4, 8))),
+    "city": lambda: _random_word(capitalize=True),
+    "country": lambda: _random_word(capitalize=True),
+    "person": lambda: _random_name(),
+    "company": lambda: _random_word(capitalize=True) + random.choice(["Corp", "Inc", "Labs", "Tech", "AI"]),
+    "func": lambda: _random_identifier(),
+    "ret": lambda: random.choice(["True", "False", "None", str(random.randint(-100, 100)), "[]", "{}", '""', "0.0"]),
+    "var": lambda: _random_identifier(style="snake"),
+    "key": lambda: _random_identifier(style="snake"),
+    "cls": lambda: _random_word(capitalize=True) + random.choice(["Handler", "Manager", "Service", "Provider", "Factory"]),
+    "parent": lambda: "Base" + _random_word(capitalize=True),
+    "method": lambda: _random_identifier(),
+    "params": lambda: ", ".join([_random_identifier(style="snake") for _ in range(random.randint(1, 3))]),
+    "date": _random_date,
+    "number": lambda: str(random.randint(1, 100000)),
+    "version": lambda: f"{random.randint(0,9)}.{random.randint(0,99)}.{random.randint(0,99)}",
+    "filename": lambda: _random_identifier(style="snake") + random.choice([".py", ".js", ".ts", ".go", ".rs"]),
+    "description": lambda: f"{_random_word()} {_random_word()} {_random_word()}",
+    "feature": lambda: _random_identifier(style="snake"),
+    "bool_val": lambda: random.choice(["true", "false"]),
 }
 
 
@@ -121,8 +198,13 @@ def generate_filler_sentence() -> str:
 
 
 def generate_filler_chunk(num_sentences: int = 5) -> str:
-    """Generate a chunk of filler text."""
-    sentences = [generate_filler_sentence() for _ in range(num_sentences)]
+    """Generate a chunk of filler text, mixing in hard negatives ~20% of the time."""
+    sentences = []
+    for _ in range(num_sentences):
+        if random.random() < 0.2:
+            sentences.append(random.choice(HARD_NEGATIVE_TEMPLATES))
+        else:
+            sentences.append(generate_filler_sentence())
     return " ".join(sentences)
 
 
@@ -146,6 +228,7 @@ class NeedleHaystackGenerator:
         num_chunks: int = 10,
         sentences_per_chunk: int = 5,
         seed: Optional[int] = None,
+        num_chunks_schedule: Optional[Callable[[int], int]] = None,
     ):
         """
         Initialize the generator.
@@ -154,19 +237,17 @@ class NeedleHaystackGenerator:
             num_chunks: Number of context chunks per example
             sentences_per_chunk: Number of filler sentences per chunk
             seed: Random seed for reproducibility
+            num_chunks_schedule: Optional callable mapping example index to
+                num_chunks, enabling curriculum learning (e.g. start easy
+                with few chunks and ramp up).
         """
         self.num_chunks = num_chunks
         self.sentences_per_chunk = sentences_per_chunk
+        self.num_chunks_schedule = num_chunks_schedule
+        self._example_count = 0
 
         if seed is not None:
             random.seed(seed)
-
-    # Template index -> category mapping (matches comment blocks in NEEDLE_TEMPLATES)
-    _TEMPLATE_CATEGORIES = (
-        ["simple"] * 5 +   # templates 0-4: simple retrieval
-        ["entity"] * 3 +   # templates 5-7: named entity retrieval
-        ["code"] * 5        # templates 8-12: code-like retrieval
-    )
 
     def _generate_needle(self) -> tuple:
         """Generate a needle fact with question and answer.
@@ -175,12 +256,9 @@ class NeedleHaystackGenerator:
             (statement, question, answer, category) tuple
         """
         template_idx = random.randrange(len(NEEDLE_TEMPLATES))
-        template = NEEDLE_TEMPLATES[template_idx]
-        category = self._TEMPLATE_CATEGORIES[template_idx]
-        statement_template, question_template, answer_template = template
+        statement_template, question_template, answer_template, category = NEEDLE_TEMPLATES[template_idx]
 
         # Find all placeholders in the templates
-        import re
         placeholders = set(re.findall(r"\{(\w+)\}", statement_template))
 
         # Generate values for each placeholder
@@ -198,11 +276,18 @@ class NeedleHaystackGenerator:
 
     def generate_example(self) -> NeedleHaystackExample:
         """Generate a single training example."""
+        # Determine number of chunks (curriculum or fixed)
+        if self.num_chunks_schedule is not None:
+            effective_num_chunks = self.num_chunks_schedule(self._example_count)
+        else:
+            effective_num_chunks = self.num_chunks
+        self._example_count += 1
+
         # Generate haystack chunks
-        chunks = [generate_filler_chunk(self.sentences_per_chunk) for _ in range(self.num_chunks)]
+        chunks = [generate_filler_chunk(self.sentences_per_chunk) for _ in range(effective_num_chunks)]
 
         # Pick random position for needle
-        needle_idx = random.randint(0, self.num_chunks - 1)
+        needle_idx = random.randint(0, effective_num_chunks - 1)
 
         # Generate needle
         needle_text, question, answer, category = self._generate_needle()
@@ -248,6 +333,7 @@ class NeedleHaystackDataset(IterableDataset):
         max_answer_length: int = 32,
         context_max_length: int = 512,
         seed: Optional[int] = None,
+        num_chunks_schedule: Optional[Callable[[int], int]] = None,
     ):
         """
         Initialize the dataset.
@@ -260,6 +346,8 @@ class NeedleHaystackDataset(IterableDataset):
             max_question_length: Maximum tokens for question
             max_answer_length: Maximum tokens for answer
             seed: Random seed for reproducibility
+            num_chunks_schedule: Optional callable mapping example index to
+                num_chunks for curriculum learning
         """
         self.tokenizer = tokenizer
         self.encoder_tokenizer = encoder_tokenizer
@@ -268,6 +356,7 @@ class NeedleHaystackDataset(IterableDataset):
             num_chunks=num_chunks,
             sentences_per_chunk=sentences_per_chunk,
             seed=seed,
+            num_chunks_schedule=num_chunks_schedule,
         )
         self.max_question_length = max_question_length
         self.max_answer_length = max_answer_length
@@ -388,8 +477,28 @@ def collate_needle_haystack(
         answer_ids[i, :a_len] = item["answer_ids"]
         answer_mask[i, :a_len] = 1
 
-    context_input_ids = torch.stack([item["context_input_ids"] for item in batch])
-    context_attention_mask = torch.stack([item["context_attention_mask"] for item in batch])
+    # Handle variable chunk counts (curriculum): pad to max chunks in batch
+    chunk_counts = [item["context_input_ids"].size(0) for item in batch]
+    max_chunks = max(chunk_counts)
+    seq_len = batch[0]["context_input_ids"].size(1)
+
+    if all(c == max_chunks for c in chunk_counts):
+        # Fast path: all same size, just stack
+        context_input_ids = torch.stack([item["context_input_ids"] for item in batch])
+        context_attention_mask = torch.stack([item["context_attention_mask"] for item in batch])
+    else:
+        # Variable chunk counts: pad with zeros (attention_mask=0 means ignored)
+        context_input_ids = torch.full(
+            (len(batch), max_chunks, seq_len), pad_token_id, dtype=torch.long
+        )
+        context_attention_mask = torch.zeros(
+            (len(batch), max_chunks, seq_len), dtype=torch.long
+        )
+        for i, item in enumerate(batch):
+            nc = item["context_input_ids"].size(0)
+            context_input_ids[i, :nc] = item["context_input_ids"]
+            context_attention_mask[i, :nc] = item["context_attention_mask"]
+
     needle_chunk_idx = torch.stack([item["needle_chunk_idx"] for item in batch])
 
     result = {
