@@ -82,35 +82,38 @@ class AwarenessInference:
         return cls(encoder, decoder, device=device, dtype=dtype)
 
     def encode_context(self, context_documents: List[str]):
-        """Encode context documents into padded memory tensors."""
-        all_k, all_v, all_mask = [], [], []
+        """Encode context documents into memory tensors.
+
+        All documents are concatenated along the sequence dimension into a
+        single [1, total_tokens, hidden] tensor so the batch dimension matches
+        a single-prompt forward pass.
+        """
+        all_k, all_v = [], []
         with torch.no_grad():
             for doc in context_documents:
                 k, v, mask = self.encoder.encode_document(
                     doc, return_mask=True, use_grad=False
                 )
-                all_k.append(k)
-                all_v.append(v)
-                all_mask.append(mask)
+                # Strip padding using the attention mask
+                real_len = mask.sum().int().item()
+                all_k.append(k.squeeze(0)[:real_len])
+                all_v.append(v.squeeze(0)[:real_len])
 
-        max_mem = max(t.size(1) for t in all_k) if all_k else 1
-        batch_size = len(all_k) or 1
+        if not all_k:
+            empty = torch.zeros(
+                1, 1, self.encoder.hidden_size,
+                device=self.device, dtype=self.dtype,
+            )
+            return empty, empty.clone(), torch.zeros(1, 1, device=self.device)
 
-        memory_key = torch.zeros(
-            batch_size,
-            max_mem,
-            self.encoder.hidden_size,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        memory_value = torch.zeros_like(memory_key)
-        memory_mask = torch.zeros(batch_size, max_mem, device=self.device)
+        # Concatenate all docs along the sequence dimension: [total_tokens, hidden]
+        cat_k = torch.cat(all_k, dim=0)
+        cat_v = torch.cat(all_v, dim=0)
 
-        for idx, (k, v, m) in enumerate(zip(all_k, all_v, all_mask)):
-            seq_len = k.size(1)
-            memory_key[idx, :seq_len] = k.squeeze(0)
-            memory_value[idx, :seq_len] = v.squeeze(0)
-            memory_mask[idx, :seq_len] = m.squeeze(0)
+        # Add batch dimension: [1, total_tokens, hidden]
+        memory_key = cat_k.unsqueeze(0)
+        memory_value = cat_v.unsqueeze(0)
+        memory_mask = torch.ones(1, cat_k.size(0), device=self.device)
 
         return memory_key, memory_value, memory_mask
 

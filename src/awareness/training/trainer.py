@@ -34,22 +34,26 @@ def build_memory_from_tokens(
     encoder_dtype = next(encoder.parameters()).dtype
     hidden_size = encoder.hidden_size
 
+    # Flatten all chunks across the batch into one encoder forward pass
+    flat_ids = context_input_ids.view(batch_size * num_chunks, seq_len)
+    flat_mask = context_attention_mask.view(batch_size * num_chunks, seq_len)
+
+    all_keys, all_values = encoder(input_ids=flat_ids, attention_mask=flat_mask)
+    # all_keys/values: [batch_size * num_chunks, seq_len, hidden_size]
+
+    # Reshape back to per-sample and strip padding
+    all_keys = all_keys.view(batch_size, num_chunks, seq_len, hidden_size)
+    all_values = all_values.view(batch_size, num_chunks, seq_len, hidden_size)
+    chunk_masks = context_attention_mask.view(batch_size, num_chunks, seq_len)
+
     sample_keys: List[torch.Tensor] = []
     sample_values: List[torch.Tensor] = []
     lengths: List[int] = []
 
     for i in range(batch_size):
-        chunk_ids = context_input_ids[i]
-        chunk_mask = context_attention_mask[i]
-        keys, values = encoder(
-            input_ids=chunk_ids,
-            attention_mask=chunk_mask,
-        )
-        keys = keys.view(-1, hidden_size)
-        values = values.view(-1, hidden_size)
-        flat_mask = chunk_mask.view(-1).bool()
-        keys = keys[flat_mask]
-        values = values[flat_mask]
+        mask_flat = chunk_masks[i].reshape(-1).bool()
+        keys = all_keys[i].reshape(-1, hidden_size)[mask_flat]
+        values = all_values[i].reshape(-1, hidden_size)[mask_flat]
         sample_keys.append(keys)
         sample_values.append(values)
         lengths.append(keys.size(0))
@@ -270,20 +274,21 @@ class AwarenessTrainer:
             # Needle precision: fraction of attention on the needle chunk's tokens
             if needle_chunk_idx is not None and memory_mask is not None:
                 # memory_mask shape: [batch, mem_len] (1=real, 0=pad)
-                # Context chunks are concatenated: each chunk has context_max_length tokens
-                # needle_chunk_idx: [batch] — which chunk is the needle
+                # Memory is built by stripping padding per-chunk then concatenating,
+                # so chunk boundaries depend on actual (non-padded) token counts.
                 batch_size = weights.size(0)
                 mem_len = weights.size(-1)
-                context_input_ids = batch.get("context_input_ids")
-                if context_input_ids is not None:
-                    num_chunks = context_input_ids.size(1)
-                    chunk_len = context_input_ids.size(2)
-                    # Build per-sample needle mask over memory positions
+                context_attention_mask = batch.get("context_attention_mask")
+                if context_attention_mask is not None:
+                    # context_attention_mask: [batch, num_chunks, seq_len]
+                    # Compute actual token count per chunk
+                    chunk_lengths = context_attention_mask.sum(dim=-1)  # [batch, num_chunks]
                     needle_mask = torch.zeros(batch_size, mem_len, device=weights.device)
                     for i in range(batch_size):
                         idx = needle_chunk_idx[i].item()
-                        start = idx * chunk_len
-                        end = min(start + chunk_len, mem_len)
+                        cumsum = chunk_lengths[i].cumsum(dim=0).long()
+                        start = cumsum[idx - 1].item() if idx > 0 else 0
+                        end = min(cumsum[idx].item(), mem_len)
                         needle_mask[i, start:end] = 1.0
                     # Compute attention mass on needle tokens: [batch, heads, seq]
                     needle_attn = (weights * needle_mask.unsqueeze(1).unsqueeze(2)).sum(dim=-1)

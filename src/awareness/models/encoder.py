@@ -95,6 +95,12 @@ class ContextEncoder(nn.Module):
             self.k_proj = None
             self.v_proj = None
 
+    def _apply(self, fn):
+        """Reset projection sync flag on device/dtype transfers."""
+        super()._apply(fn)
+        self._projections_synced = False
+        return self
+
     @property
     def device(self) -> torch.device:
         """Get the device the model is on."""
@@ -144,7 +150,6 @@ class ContextEncoder(nn.Module):
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            output_hidden_states=True,
         )
         hidden_states = outputs.last_hidden_state
 
