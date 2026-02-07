@@ -258,6 +258,7 @@ class AwarenessTrainer:
 
         all_entropy = []
         all_needle_prec = []
+        all_topk = []
         needle_chunk_idx = batch.get("needle_chunk_idx")
 
         for key, block in unwrapped_decoder.gca_blocks.items():
@@ -295,6 +296,13 @@ class AwarenessTrainer:
                     avg_needle_prec = needle_attn.mean().item()
                     all_needle_prec.append(avg_needle_prec)
 
+            # Top-K concentration: fraction of attention on top-5 memory positions
+            # Averaged over batch, heads, and sequence positions
+            top_k = min(5, weights.size(-1))
+            topk_vals, _ = weights.topk(top_k, dim=-1)  # [batch, heads, seq, top_k]
+            topk_concentration = topk_vals.sum(dim=-1).mean().item()
+            all_topk.append(topk_concentration)
+
             # Clear stored weights
             block._last_attn_weights = None
 
@@ -302,6 +310,8 @@ class AwarenessTrainer:
             metrics["attn_entropy"] = sum(all_entropy) / len(all_entropy)
         if all_needle_prec:
             metrics["needle_precision"] = sum(all_needle_prec) / len(all_needle_prec)
+        if all_topk:
+            metrics["attn_top5_concentration"] = sum(all_topk) / len(all_topk)
 
         return metrics
 

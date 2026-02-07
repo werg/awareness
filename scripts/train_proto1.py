@@ -53,6 +53,7 @@ from awareness.data.synthetic.needle_haystack import (
     NeedleHaystackDataset,
     collate_needle_haystack,
 )
+from awareness.data.synthetic.lookup_table import LookupTableDataset
 from awareness.training.trainer import (
     AwarenessTrainer,
     validate_quantized_training,
@@ -101,12 +102,17 @@ def evaluate(
     base_decoder = getattr(decoder, "module", decoder)
     base_encoder = getattr(encoder, "module", encoder)
     base_decoder.eval()
-    correct = 0
+    exact_correct = 0
+    substring_correct = 0
     total = 0
 
     # Per-category tracking
-    category_correct: dict = {}
+    category_exact: dict = {}
+    category_substring: dict = {}
     category_total: dict = {}
+
+    # Failure analysis (first 3 failures per category)
+    failures_by_category: dict = {}
 
     logger.info(f"Starting evaluation (max {num_samples} samples)...")
 
@@ -154,35 +160,69 @@ def evaluate(
                 expected = base_decoder.tokenizer.decode(
                     batch["answer_ids"][i][answer_mask],
                     skip_special_tokens=True,
-                ).lower()
+                ).strip().lower()
                 generated_text = base_decoder.tokenizer.decode(
                     generated[i][question_ids.size(1):],
                     skip_special_tokens=True,
-                ).lower()
+                ).strip().lower()
 
-                # Use word-boundary match to avoid false positives on short
-                # answers like "True", "0", "None" appearing inside other words.
-                is_correct = bool(
+                # Exact match: primary metric
+                is_exact = (
+                    generated_text == expected
+                    or generated_text.startswith(expected)
+                )
+
+                # Substring match with word boundary: secondary metric
+                is_substring = bool(
                     expected
                     and re.search(r'(?<!\w)' + re.escape(expected) + r'(?!\w)', generated_text)
                 )
-                if is_correct:
-                    correct += 1
+
+                if is_exact:
+                    exact_correct += 1
+                if is_substring:
+                    substring_correct += 1
                 total += 1
 
                 # Track per-category accuracy
+                cat = None
                 if categories is not None and i < len(categories):
                     cat = categories[i]
                     category_total[cat] = category_total.get(cat, 0) + 1
-                    category_correct[cat] = category_correct.get(cat, 0) + (1 if is_correct else 0)
+                    category_exact[cat] = category_exact.get(cat, 0) + (1 if is_exact else 0)
+                    category_substring[cat] = category_substring.get(cat, 0) + (1 if is_substring else 0)
 
-    accuracy = correct / total if total > 0 else 0
-    logger.info(f"Evaluation complete: {correct}/{total} = {accuracy:.2%}")
+                # Track failures for debugging
+                if not is_exact and cat is not None:
+                    failures = failures_by_category.setdefault(cat, [])
+                    if len(failures) < 3:
+                        question_text = base_decoder.tokenizer.decode(
+                            question_ids[i], skip_special_tokens=True,
+                        )
+                        failures.append({
+                            "question": question_text,
+                            "expected": expected,
+                            "generated": generated_text,
+                        })
+
+    exact_accuracy = exact_correct / total if total > 0 else 0
+    substring_accuracy = substring_correct / total if total > 0 else 0
+    logger.info(f"Evaluation complete: exact={exact_correct}/{total} ({exact_accuracy:.2%}), "
+                f"substring={substring_correct}/{total} ({substring_accuracy:.2%})")
 
     # Log per-category accuracy
     for cat in sorted(category_total.keys()):
-        cat_acc = category_correct.get(cat, 0) / category_total[cat]
-        logger.info(f"  {cat}: {category_correct.get(cat, 0)}/{category_total[cat]} = {cat_acc:.2%}")
+        cat_exact = category_exact.get(cat, 0) / category_total[cat]
+        cat_sub = category_substring.get(cat, 0) / category_total[cat]
+        logger.info(f"  {cat}: exact={cat_exact:.2%}, substring={cat_sub:.2%} ({category_total[cat]} samples)")
+
+    # Log failure examples
+    for cat, failures in sorted(failures_by_category.items()):
+        if failures:
+            logger.info(f"  {cat} failures ({len(failures)} shown):")
+            for f in failures:
+                logger.info(f"    Q: {f['question'][:80]}")
+                logger.info(f"    Expected: {f['expected']}, Got: {f['generated'][:60]}")
 
     gate_values = (
         base_decoder.get_gate_values()
@@ -194,26 +234,30 @@ def evaluate(
     # Log via Accelerate's tracker (handles W&B internally)
     if accelerator is not None and accelerator.is_main_process:
         log_dict = {
-            f"{prefix}/accuracy": accuracy,
-            f"{prefix}/correct": correct,
+            f"{prefix}/accuracy": exact_accuracy,
+            f"{prefix}/exact_match": exact_accuracy,
+            f"{prefix}/substring_match": substring_accuracy,
+            f"{prefix}/correct": exact_correct,
             f"{prefix}/total": total,
             f"{prefix}/gate_avg": avg_gate,
         }
         for k, v in gate_values.items():
             log_dict[f"{prefix}/gate/{k}"] = v
-        # Per-category accuracy
+        # Per-category accuracy (exact match)
         for cat in category_total:
-            cat_acc = category_correct.get(cat, 0) / category_total[cat]
-            log_dict[f"{prefix}/accuracy/{cat}"] = cat_acc
+            cat_exact = category_exact.get(cat, 0) / category_total[cat]
+            log_dict[f"{prefix}/accuracy/{cat}"] = cat_exact
         accelerator.log(log_dict, step=step)
 
     return {
-        "accuracy": accuracy,
-        "correct": correct,
+        "accuracy": exact_accuracy,
+        "exact_match": exact_accuracy,
+        "substring_match": substring_accuracy,
+        "correct": exact_correct,
         "total": total,
         "gate_values": gate_values,
         "category_accuracy": {
-            cat: category_correct.get(cat, 0) / category_total[cat]
+            cat: category_exact.get(cat, 0) / category_total[cat]
             for cat in category_total
         },
     }
@@ -310,6 +354,8 @@ def load_decoder(
     model_name: str,
     quantize: bool,
     bnb_config: Optional[BitsAndBytesConfig],
+    gca_attn_dropout: float = 0.0,
+    gca_output_dropout: float = 0.0,
 ) -> AwarenessDecoder:
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     return AwarenessDecoder(
@@ -317,6 +363,8 @@ def load_decoder(
         tokenizer=tokenizer,
         torch_dtype=torch.bfloat16,
         quantization_config=bnb_config if quantize else None,
+        gca_attn_dropout=gca_attn_dropout,
+        gca_output_dropout=gca_output_dropout,
     )
 
 
@@ -462,6 +510,42 @@ def main():
         default=None,
         help="Optional cap on total training steps",
     )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=["needle", "lookup", "mixed"],
+        default="mixed",
+        help="Dataset type: needle-in-haystack, lookup table, or both mixed",
+    )
+    parser.add_argument(
+        "--gca-attn-dropout",
+        type=float,
+        default=0.1,
+        help="Attention dropout in GCA blocks",
+    )
+    parser.add_argument(
+        "--gca-output-dropout",
+        type=float,
+        default=0.1,
+        help="Output dropout in GCA blocks (before gated residual)",
+    )
+    parser.add_argument(
+        "--curriculum",
+        action="store_true",
+        help="Enable context size curriculum (ramp chunk count during training)",
+    )
+    parser.add_argument(
+        "--min-chunks",
+        type=int,
+        default=3,
+        help="Minimum chunks for curriculum (start of training)",
+    )
+    parser.add_argument(
+        "--max-chunks",
+        type=int,
+        default=20,
+        help="Maximum chunks for curriculum (end of training)",
+    )
 
     args = parser.parse_args()
 
@@ -497,36 +581,102 @@ def main():
         model_name=args.decoder_model,
         quantize=args.quantize_base,
         bnb_config=bnb_config,
+        gca_attn_dropout=args.gca_attn_dropout,
+        gca_output_dropout=args.gca_output_dropout,
     )
     logger.info(f"Decoder loaded: {decoder}")
+    logger.info(f"GCA dropout: attn={args.gca_attn_dropout}, output={args.gca_output_dropout}")
 
     # Create datasets
     # Proto-1 is a smoke test — small haystack (4 chunks x 3 sentences) keeps
     # encoder cost low while still validating retrieval. 3 sentences ~30-60 tokens,
     # 128 gives padding headroom.
     context_chunk_length = 128
+    num_chunks = 4
+    sentences_per_chunk = 3
 
-    logger.info("Creating training dataset...")
-    train_dataset = NeedleHaystackDataset(
-        tokenizer=decoder.tokenizer,
-        encoder_tokenizer=encoder.tokenizer,
-        num_examples=args.num_train_examples,
-        num_chunks=4,
-        sentences_per_chunk=3,
-        context_max_length=context_chunk_length,
-        seed=args.seed,
-    )
+    # Curriculum: ramp chunk count over training examples
+    curriculum_schedule = None
+    if args.curriculum:
+        total_examples = args.num_train_examples
+        min_c, max_c = args.min_chunks, args.max_chunks
+        def curriculum_schedule(example_idx: int) -> int:
+            progress = min(example_idx / total_examples, 1.0)
+            return min_c + int(progress * (max_c - min_c))
+        logger.info(f"Curriculum enabled: {min_c} -> {max_c} chunks over {total_examples} examples")
+        num_chunks = max_c  # Use max for eval and as base
+
+    logger.info(f"Creating training dataset (type={args.dataset})...")
+
+    if args.dataset == "needle":
+        train_dataset = NeedleHaystackDataset(
+            tokenizer=decoder.tokenizer,
+            encoder_tokenizer=encoder.tokenizer,
+            num_examples=args.num_train_examples,
+            num_chunks=num_chunks,
+            sentences_per_chunk=sentences_per_chunk,
+            context_max_length=context_chunk_length,
+            seed=args.seed,
+            num_chunks_schedule=curriculum_schedule,
+        )
+    elif args.dataset == "lookup":
+        train_dataset = LookupTableDataset(
+            tokenizer=decoder.tokenizer,
+            encoder_tokenizer=encoder.tokenizer,
+            num_examples=args.num_train_examples,
+            num_chunks=num_chunks,
+            entries_per_chunk=3,
+            context_max_length=context_chunk_length,
+            seed=args.seed,
+            num_chunks_schedule=curriculum_schedule,
+        )
+    else:  # mixed
+        from torch.utils.data import ChainDataset
+        half = args.num_train_examples // 2
+        needle_ds = NeedleHaystackDataset(
+            tokenizer=decoder.tokenizer,
+            encoder_tokenizer=encoder.tokenizer,
+            num_examples=half,
+            num_chunks=num_chunks,
+            sentences_per_chunk=sentences_per_chunk,
+            context_max_length=context_chunk_length,
+            seed=args.seed,
+            num_chunks_schedule=curriculum_schedule,
+        )
+        lookup_ds = LookupTableDataset(
+            tokenizer=decoder.tokenizer,
+            encoder_tokenizer=encoder.tokenizer,
+            num_examples=args.num_train_examples - half,
+            num_chunks=num_chunks,
+            entries_per_chunk=3,
+            context_max_length=context_chunk_length,
+            seed=args.seed + 100,
+            num_chunks_schedule=curriculum_schedule,
+        )
+        train_dataset = ChainDataset([needle_ds, lookup_ds])
 
     logger.info("Creating evaluation dataset...")
-    eval_dataset = NeedleHaystackDataset(
+    # Eval always uses both dataset types at fixed chunk count (no curriculum)
+    eval_needle = NeedleHaystackDataset(
         tokenizer=decoder.tokenizer,
         encoder_tokenizer=encoder.tokenizer,
-        num_examples=args.num_eval_examples,
-        num_chunks=4,
-        sentences_per_chunk=3,
+        num_examples=args.num_eval_examples // 2,
+        num_chunks=num_chunks,
+        sentences_per_chunk=sentences_per_chunk,
         context_max_length=context_chunk_length,
-        seed=args.seed + 1,  # Different seed for eval
+        seed=args.seed + 1,
     )
+    eval_lookup = LookupTableDataset(
+        tokenizer=decoder.tokenizer,
+        encoder_tokenizer=encoder.tokenizer,
+        num_examples=args.num_eval_examples - args.num_eval_examples // 2,
+        num_chunks=num_chunks,
+        entries_per_chunk=3,
+        context_max_length=context_chunk_length,
+        seed=args.seed + 2,
+    )
+    from torch.utils.data import ChainDataset
+    eval_dataset = ChainDataset([eval_needle, eval_lookup])
 
     # Create dataloaders (left-padding for decoder-only generation)
     collate_fn = partial(
@@ -572,6 +722,10 @@ def main():
         "warmup_steps": args.warmup_steps,
         "encoder_lora_r": args.encoder_lora_r,
         "encoder_lora_alpha": args.encoder_lora_alpha,
+        "dataset": args.dataset,
+        "gca_attn_dropout": args.gca_attn_dropout,
+        "gca_output_dropout": args.gca_output_dropout,
+        "curriculum": args.curriculum,
     }
 
     effective_batches_per_epoch = math.ceil(
