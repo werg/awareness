@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 
 from awareness.models.decoder import GatedCrossAttention
-from awareness.models.awareness_decoder import gca_layer_schedule
 
 
 class TestGatedCrossAttention:
@@ -611,40 +610,3 @@ class TestLookupTableData:
         )
 
 
-class TestGCALayerSchedule:
-    """Tests for the gca_layer_schedule helper function."""
-
-    def test_default_28_layers(self):
-        """Default: every 3rd from layer 9 for 28 layers."""
-        layers = gca_layer_schedule(28)
-        assert layers == [9, 12, 15, 18, 21, 24, 27]
-
-    def test_default_12_layers(self):
-        """Default: every 3rd from layer 4 for 12 layers."""
-        layers = gca_layer_schedule(12)
-        assert layers == [4, 7, 10]
-
-    def test_custom_start(self):
-        """every_n=3 starting at layer 6 (RETRO-style for 28 layers)."""
-        layers = gca_layer_schedule(28, every_n=3, start_layer=6)
-        assert layers == [6, 9, 12, 15, 18, 21, 24, 27]
-
-    def test_every_2_from_midpoint(self):
-        """every_n=2 starting at layer 14."""
-        layers = gca_layer_schedule(28, every_n=2, start_layer=14)
-        assert layers == [14, 16, 18, 20, 22, 24, 26]
-
-    def test_32_layers_retro_style(self):
-        """RETRO paper config: 32 layers, every 3 from layer 6."""
-        layers = gca_layer_schedule(32, every_n=3, start_layer=6)
-        assert layers == [6, 9, 12, 15, 18, 21, 24, 27, 30]
-
-    def test_sparser_every_5(self):
-        """every_n=5 produces fewer blocks than every_n=3."""
-        sparse = gca_layer_schedule(28, every_n=5)
-        dense = gca_layer_schedule(28, every_n=3)
-        assert len(sparse) < len(dense)
-
-    def test_result_is_sorted(self):
-        layers = gca_layer_schedule(28, every_n=5, start_layer=3)
-        assert layers == sorted(layers)

@@ -131,18 +131,26 @@ class ContextEncoder(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return_eos: bool = False,
+    ) -> Union[
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
         """
         Encode documents into KV tensor pairs.
 
         Args:
             input_ids: Token IDs [batch_size, seq_length]
             attention_mask: Attention mask [batch_size, seq_length]
+            return_eos: If True, additionally return the EOS (last real token)
+                hidden state per sequence, before KV projection.
 
         Returns:
-            Tuple of (K_mem, V_mem):
+            If return_eos=False: (K_mem, V_mem)
+            If return_eos=True: (K_mem, V_mem, eos_hidden)
             - K_mem: Key tensor [batch_size, seq_length, hidden_size]
             - V_mem: Value tensor [batch_size, seq_length, hidden_size]
+            - eos_hidden: Raw hidden state at EOS position [batch_size, backbone_hidden_size]
         """
         # Ensure projections are on the correct device (lazy sync)
         self._sync_projections()
@@ -153,6 +161,21 @@ class ContextEncoder(nn.Module):
         )
         hidden_states = outputs.last_hidden_state
 
+        eos_hidden = None
+        if return_eos:
+            # Extract EOS hidden state (last real token per sequence)
+            if attention_mask is not None:
+                eos_positions = (attention_mask.sum(dim=1).long() - 1).clamp(min=0)
+            else:
+                eos_positions = torch.full(
+                    (input_ids.size(0),), input_ids.size(1) - 1,
+                    dtype=torch.long, device=input_ids.device,
+                )
+            eos_hidden = hidden_states[
+                torch.arange(input_ids.size(0), device=input_ids.device),
+                eos_positions,
+            ]  # [batch_size, backbone_hidden_size]
+
         if self.k_proj is not None and self.v_proj is not None:
             memory_key = self.k_proj(hidden_states)
             memory_value = self.v_proj(hidden_states)
@@ -160,6 +183,8 @@ class ContextEncoder(nn.Module):
             memory_key = hidden_states
             memory_value = hidden_states
 
+        if return_eos:
+            return memory_key, memory_value, eos_hidden
         return memory_key, memory_value
 
     def encode_document(

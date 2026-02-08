@@ -1,20 +1,38 @@
-"""Reasoning Kernel / Decoder (D_φ): Decoder-only LLM with Gated Cross-Attention.
+"""Gated Cross-Attention (GCA) primitives for the Awareness decoder.
 
-From PLAN.md Section 2.3:
-- Base Architecture: Standard Causal Self-Attention (CSA) handles immediate instruction
-- Augmentation: CSA blocks are interleaved with GCA blocks (default: every 3rd layer)
-- Mechanism: Attention(Q, K, V) = softmax(Q_loc @ K_mem^T / sqrt(d_k)) @ V_mem
-  - Q_loc: Queries from Decoder's current prompt
-  - K_mem, V_mem: Pre-computed tensors fetched from Memory Store
-- Gradient Flow: During training, gradients propagate from D_φ through cross-attention
-  into E_θ, forcing encoder to learn representations useful for decoder's reasoning
+Provides Float32RMSNorm and GatedCrossAttention, the building blocks used by
+StagedHead (fine-grained token attention) and AwarenessDecoder (hook injection).
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+class Float32RMSNorm(nn.Module):
+    """RMSNorm that stores weight in float32 for optimizer precision,
+    but casts it to input dtype for the fused kernel path.
+
+    Standard nn.RMSNorm with float32 weight receiving bf16 input triggers
+    a 'mismatch dtype' warning and disables the fused CUDA implementation.
+    This subclass avoids both issues.
+    """
+
+    def __init__(self, normalized_shape: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(normalized_shape, dtype=torch.float32))
+
+    def _apply(self, fn):
+        """Keep weight in float32 through .to(), .bfloat16(), etc."""
+        super()._apply(fn)
+        self.weight.data = self.weight.data.float()
+        return self
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.rms_norm(x, self.weight.shape, self.weight.to(x.dtype), self.eps)
 
 
 class GatedCrossAttention(nn.Module):
@@ -180,69 +198,3 @@ class GatedCrossAttention(nn.Module):
         return base + gate_value * attn_output
 
 
-class ReasoningDecoder(nn.Module):
-    """
-    The Reasoning Kernel / Decoder (D_φ) - Abstract base class.
-
-    A decoder-only LLM augmented with Gated Cross-Attention blocks
-    at configurable layers (default: every 3rd layer, RETRO-style).
-
-    See AwarenessDecoder for the concrete Qwen3-based implementation.
-    """
-
-    def __init__(self, hidden_size: int, num_layers: int, num_heads: int):
-        """
-        Args:
-            hidden_size: Model hidden dimension
-            num_layers: Total number of decoder layers
-            num_heads: Number of attention heads
-        """
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-
-        # Default GCA placement: upper 1/3 of network
-        # Concrete implementations (AwarenessDecoder) support configurable placement
-        self.gca_start_layer = num_layers * 2 // 3
-
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        memory_key: Optional[torch.Tensor] = None,
-        memory_value: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, ...]:
-        """
-        Forward pass with optional cross-attention to memory.
-
-        Args:
-            input_ids: Input token IDs [batch, seq_len]
-            attention_mask: Attention mask for input [batch, seq_len]
-            memory_key: K_mem from encoder [batch, mem_len, hidden]
-            memory_value: V_mem from encoder [batch, mem_len, hidden]
-            labels: Target token IDs for loss computation [batch, seq_len]
-
-        Returns:
-            Model outputs (implementation-specific)
-        """
-        raise NotImplementedError(
-            "Decoder implementation depends on chosen backbone model. "
-            "Use AwarenessDecoder for Qwen3-based implementation."
-        )
-
-    def generate(
-        self,
-        input_ids: torch.Tensor,
-        memory_key: Optional[torch.Tensor] = None,
-        memory_value: Optional[torch.Tensor] = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        """
-        Generate text with awareness of memory.
-
-        During generation, each forward pass cross-attends to the memory store,
-        giving the model "awareness" of the full repository context.
-        """
-        raise NotImplementedError

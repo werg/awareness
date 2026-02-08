@@ -14,7 +14,6 @@ Usage:
 import argparse
 import json
 import logging
-import random
 import sys
 from functools import partial
 from pathlib import Path
@@ -45,6 +44,12 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def read_pipeline_config(checkpoint_path: str) -> dict:
+    """Read pipeline config from a checkpoint without loading full weights."""
+    state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    return state.get("pipeline_config", {})
 
 
 def load_checkpoint_weights(encoder, decoder, checkpoint_path: str):
@@ -198,6 +203,11 @@ def main():
     logger.info(f"Batch size: {args.batch_size}")
     logger.info("=" * 60)
 
+    # Read pipeline config from checkpoint so decoder layout matches
+    pipeline_cfg = read_pipeline_config(args.checkpoint)
+    if pipeline_cfg:
+        logger.info(f"Pipeline config from checkpoint: {pipeline_cfg}")
+
     # Load models (no quantization for eval - simpler and avoids peft dependency)
     logger.info("Loading encoder...")
     encoder = load_encoder(
@@ -215,6 +225,7 @@ def main():
         bnb_config=None,
         gca_attn_dropout=0.0,  # No dropout at eval time
         gca_output_dropout=0.0,
+        **pipeline_cfg,
     )
 
     # Load checkpoint weights

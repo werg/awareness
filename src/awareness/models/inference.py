@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List
 
 import torch
 from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
@@ -27,6 +27,15 @@ class AwarenessInference:
         self.device = device
         self.dtype = dtype
 
+        # Validate hidden size compatibility for pipeline coarse attention
+        enc_backbone = getattr(encoder, "backbone_hidden_size", None)
+        dec_hidden = getattr(decoder, "hidden_size", None)
+        if enc_backbone is not None and dec_hidden is not None and enc_backbone != dec_hidden:
+            raise ValueError(
+                f"Encoder backbone hidden size ({enc_backbone}) != decoder hidden size "
+                f"({dec_hidden}). Pipeline coarse attention requires these to match."
+            )
+
         self.encoder.to(device=self.device, dtype=self.dtype)
         self.decoder.to(device=self.device, dtype=self.dtype)
 
@@ -43,6 +52,7 @@ class AwarenessInference:
         Load encoder/decoder weights from a checkpoint produced by AwarenessTrainer.
         """
         checkpoint = torch.load(Path(checkpoint_path), map_location="cpu")
+        pipeline_cfg = checkpoint.get("pipeline_config", {})
 
         encoder_tokenizer = AutoTokenizer.from_pretrained(
             encoder_name, trust_remote_code=True
@@ -76,46 +86,85 @@ class AwarenessInference:
             base_model=decoder_base,
             tokenizer=decoder_tokenizer,
             torch_dtype=dtype,
+            **pipeline_cfg,
         )
         decoder.load_state_dict(checkpoint["decoder"], strict=False)
 
         return cls(encoder, decoder, device=device, dtype=dtype)
 
-    def encode_context(self, context_documents: List[str]):
-        """Encode context documents into memory tensors.
+    def encode_context(
+        self, context_documents: List[str],
+    ) -> Dict[str, torch.Tensor]:
+        """Encode context documents into pipeline memory tensors.
 
-        All documents are concatenated along the sequence dimension into a
-        single [1, total_tokens, hidden] tensor so the batch dimension matches
-        a single-prompt forward pass.
+        Returns:
+            Dict with keys: doc_summary_key, doc_summary_value, doc_summary_mask,
+            token_key, token_value, token_mask, doc_token_map.
+            All tensors have batch dimension 1.
         """
-        all_k, all_v = [], []
+        all_k: List[torch.Tensor] = []
+        all_v: List[torch.Tensor] = []
+        all_eos: List[torch.Tensor] = []
+        doc_map_parts: List[torch.Tensor] = []
+
         with torch.no_grad():
-            for doc in context_documents:
-                k, v, mask = self.encoder.encode_document(
-                    doc, return_mask=True, use_grad=False
+            for doc_idx, doc in enumerate(context_documents):
+                inputs = self.encoder.tokenizer(
+                    doc,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=self.encoder.max_length,
+                    padding=False,
                 )
-                # Strip padding using the attention mask
-                real_len = mask.sum().int().item()
-                all_k.append(k.squeeze(0)[:real_len])
-                all_v.append(v.squeeze(0)[:real_len])
+                input_ids = inputs["input_ids"].to(self.device)
+                attention_mask = inputs["attention_mask"].to(self.device)
 
-        if not all_k:
-            empty = torch.zeros(
-                1, 1, self.encoder.hidden_size,
-                device=self.device, dtype=self.dtype,
-            )
-            return empty, empty.clone(), torch.zeros(1, 1, device=self.device)
+                k_mem, v_mem, eos_hidden = self.encoder(
+                    input_ids, attention_mask, return_eos=True,
+                )
 
-        # Concatenate all docs along the sequence dimension: [total_tokens, hidden]
-        cat_k = torch.cat(all_k, dim=0)
-        cat_v = torch.cat(all_v, dim=0)
+                # Strip padding
+                real_len = attention_mask.sum().int().item()
+                all_k.append(k_mem.squeeze(0)[:real_len])
+                all_v.append(v_mem.squeeze(0)[:real_len])
+                all_eos.append(eos_hidden.squeeze(0))  # [hidden]
+                doc_map_parts.append(
+                    torch.full((real_len,), doc_idx, dtype=torch.long, device=self.device)
+                )
 
-        # Add batch dimension: [1, total_tokens, hidden]
-        memory_key = cat_k.unsqueeze(0)
-        memory_value = cat_v.unsqueeze(0)
-        memory_mask = torch.ones(1, cat_k.size(0), device=self.device)
+        num_docs = len(context_documents)
+        backbone_hidden = self.encoder.backbone_hidden_size
+        hidden_size = self.encoder.hidden_size
 
-        return memory_key, memory_value, memory_mask
+        if num_docs == 0:
+            return {
+                "doc_summary_key": torch.zeros(1, 1, backbone_hidden, device=self.device, dtype=self.dtype),
+                "doc_summary_value": torch.zeros(1, 1, backbone_hidden, device=self.device, dtype=self.dtype),
+                "doc_summary_mask": torch.zeros(1, 1, device=self.device),
+                "token_key": torch.zeros(1, 1, hidden_size, device=self.device, dtype=self.dtype),
+                "token_value": torch.zeros(1, 1, hidden_size, device=self.device, dtype=self.dtype),
+                "token_mask": torch.zeros(1, 1, device=self.device),
+                "doc_token_map": torch.zeros(1, 1, dtype=torch.long, device=self.device),
+            }
+
+        # Doc summaries: [1, num_docs, backbone_hidden]
+        doc_summary = torch.stack(all_eos, dim=0).unsqueeze(0)
+
+        # Token-level KV: [1, total_tokens, hidden]
+        cat_k = torch.cat(all_k, dim=0).unsqueeze(0)
+        cat_v = torch.cat(all_v, dim=0).unsqueeze(0)
+        cat_map = torch.cat(doc_map_parts, dim=0).unsqueeze(0)
+        total_tokens = cat_k.size(1)
+
+        return {
+            "doc_summary_key": doc_summary,
+            "doc_summary_value": doc_summary.clone(),
+            "doc_summary_mask": torch.ones(1, num_docs, device=self.device),
+            "token_key": cat_k,
+            "token_value": cat_v,
+            "token_mask": torch.ones(1, total_tokens, device=self.device),
+            "doc_token_map": cat_map,
+        }
 
     @torch.inference_mode()
     def generate(
@@ -133,13 +182,12 @@ class AwarenessInference:
             padding=True,
         ).to(self.device)
 
-        memory_key, memory_value, memory_mask = self.encode_context(context_documents)
+        pipeline_memory = self.encode_context(context_documents)
 
         output_ids = self.decoder.generate(
             input_ids=inputs.input_ids,
-            memory_key=memory_key,
-            memory_value=memory_value,
-            memory_mask=memory_mask,
+            attention_mask=inputs.attention_mask,
+            pipeline_memory=pipeline_memory,
             max_new_tokens=max_new_tokens,
             pad_token_id=tokenizer.pad_token_id,
             **generate_kwargs,

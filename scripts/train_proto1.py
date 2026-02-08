@@ -32,7 +32,7 @@ try:
 except ImportError:
     wandb = None
     WANDB_AVAILABLE = False
-from torch.utils.data import DataLoader
+from torch.utils.data import ChainDataset, DataLoader
 from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
 
 try:
@@ -48,7 +48,7 @@ except ImportError:  # pragma: no cover - optional dependency
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from awareness.models.encoder import ContextEncoder
-from awareness.models.awareness_decoder import AwarenessDecoder, gca_layer_schedule
+from awareness.models.awareness_decoder import AwarenessDecoder
 from awareness.data.synthetic.needle_haystack import (
     CATEGORY_NAMES,
     NeedleHaystackDataset,
@@ -58,7 +58,7 @@ from awareness.data.synthetic.lookup_table import LookupTableDataset
 from awareness.training.trainer import (
     AwarenessTrainer,
     validate_quantized_training,
-    build_memory_from_tokens,
+    build_pipeline_memory_from_tokens,
 )
 
 logging.basicConfig(
@@ -128,13 +128,13 @@ def evaluate(
             context_attention_mask = batch["context_attention_mask"].to(base_encoder.device)
 
             logger.info(f"  Encoding context...")
-            memory_key, memory_value, memory_mask = build_memory_from_tokens(
+            pipeline_memory = build_pipeline_memory_from_tokens(
                 base_encoder,
                 context_input_ids,
                 context_attention_mask,
                 base_encoder.device,
             )
-            logger.info(f"  Context encoded, memory shape: {memory_key.shape}")
+            logger.info(f"  Pipeline memory built, token_key shape: {pipeline_memory['token_key'].shape}")
 
             question_ids = batch["question_ids"].to(base_decoder.device)
             question_mask = batch["question_mask"].to(base_decoder.device)
@@ -143,9 +143,7 @@ def evaluate(
             generated = base_decoder.generate(
                 input_ids=question_ids,
                 attention_mask=question_mask,
-                memory_key=memory_key,
-                memory_value=memory_value,
-                memory_mask=memory_mask,
+                pipeline_memory=pipeline_memory,
                 max_new_tokens=20,
                 do_sample=False,
                 temperature=None,
@@ -361,7 +359,9 @@ def load_decoder(
     bnb_config: Optional[BitsAndBytesConfig],
     gca_attn_dropout: float = 0.0,
     gca_output_dropout: float = 0.0,
-    gca_layers: Optional[list] = None,
+    pipeline_num_heads: int = 4,
+    pipeline_gap: int = 3,
+    pipeline_start_layer: int = 6,
 ) -> AwarenessDecoder:
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     return AwarenessDecoder(
@@ -371,7 +371,9 @@ def load_decoder(
         quantization_config=bnb_config if quantize else None,
         gca_attn_dropout=gca_attn_dropout,
         gca_output_dropout=gca_output_dropout,
-        gca_layers=gca_layers,
+        pipeline_num_heads=pipeline_num_heads,
+        pipeline_gap=pipeline_gap,
+        pipeline_start_layer=pipeline_start_layer,
     )
 
 
@@ -537,27 +539,9 @@ def main():
         help="Output dropout in GCA blocks (before gated residual)",
     )
     parser.add_argument(
-        "--gca-every-n",
-        type=int,
-        default=3,
-        help="Spacing for 'every_n' GCA strategy (default: 3, RETRO-style)",
-    )
-    parser.add_argument(
-        "--gca-start-layer",
-        type=int,
-        default=None,
-        help="First GCA layer for 'every_n' strategy (default: num_layers // 3)",
-    )
-    parser.add_argument(
-        "--gca-layers",
-        type=str,
-        default=None,
-        help="Explicit comma-separated GCA layer indices (overrides --gca-strategy)",
-    )
-    parser.add_argument(
-        "--curriculum",
+        "--no-curriculum",
         action="store_true",
-        help="Enable context size curriculum (ramp chunk count during training)",
+        help="Disable context size curriculum (use fixed chunk count)",
     )
     parser.add_argument(
         "--min-chunks",
@@ -568,7 +552,7 @@ def main():
     parser.add_argument(
         "--max-chunks",
         type=int,
-        default=20,
+        default=12,
         help="Maximum chunks for curriculum (end of training)",
     )
     parser.add_argument(
@@ -590,6 +574,36 @@ def main():
         type=float,
         default=1e-5,
         help="Learning rate for unfrozen base model layers",
+    )
+    parser.add_argument(
+        "--pipeline-num-heads",
+        type=int,
+        default=4,
+        help="Number of coarse-fine head pairs (pipeline mode)",
+    )
+    parser.add_argument(
+        "--pipeline-gap",
+        type=int,
+        default=3,
+        help="Layer spacing between coarse and fine (pipeline mode)",
+    )
+    parser.add_argument(
+        "--pipeline-start-layer",
+        type=int,
+        default=6,
+        help="First coarse layer index (pipeline mode)",
+    )
+    parser.add_argument(
+        "--routing-sparsity-weight",
+        type=float,
+        default=0.01,
+        help="Weight for routing sparsity loss (pipeline mode)",
+    )
+    parser.add_argument(
+        "--routing-balance-weight",
+        type=float,
+        default=0.01,
+        help="Weight for routing balance loss (pipeline mode)",
     )
 
     args = parser.parse_args()
@@ -621,30 +635,20 @@ def main():
     )
     logger.info(f"Encoder loaded: {encoder}")
 
-    # Compute GCA layer placement
-    if args.gca_layers is not None:
-        gca_layers = [int(x.strip()) for x in args.gca_layers.split(",")]
-    else:
-        from transformers import AutoConfig as _AC
-        _cfg = _AC.from_pretrained(args.decoder_model, trust_remote_code=True)
-        gca_layers = gca_layer_schedule(
-            _cfg.num_hidden_layers,
-            every_n=args.gca_every_n,
-            start_layer=args.gca_start_layer,
-        )
-
-    logger.info("Loading decoder with GCA...")
+    logger.info("Loading decoder...")
     decoder = load_decoder(
         model_name=args.decoder_model,
         quantize=args.quantize_base,
         bnb_config=bnb_config,
         gca_attn_dropout=args.gca_attn_dropout,
         gca_output_dropout=args.gca_output_dropout,
-        gca_layers=gca_layers,
+        pipeline_num_heads=args.pipeline_num_heads,
+        pipeline_gap=args.pipeline_gap,
+        pipeline_start_layer=args.pipeline_start_layer,
     )
     logger.info(f"Decoder loaded: {decoder}")
-    logger.info(f"GCA layers: {decoder.gca_layer_indices}")
-    logger.info(f"GCA dropout: attn={args.gca_attn_dropout}, output={args.gca_output_dropout}")
+    logger.info(f"Hook layers: {decoder.gca_layer_indices}")
+    logger.info(f"Dropout: attn={args.gca_attn_dropout}, output={args.gca_output_dropout}")
 
     # Create datasets
     # Proto-1 is a smoke test — small haystack (4 chunks x 3 sentences) keeps
@@ -656,7 +660,7 @@ def main():
 
     # Curriculum: ramp chunk count over training examples
     curriculum_schedule = None
-    if args.curriculum:
+    if not args.no_curriculum:
         total_examples = args.num_train_examples
         min_c, max_c = args.min_chunks, args.max_chunks
         def curriculum_schedule(example_idx: int) -> int:
@@ -690,7 +694,6 @@ def main():
             num_chunks_schedule=curriculum_schedule,
         )
     else:  # mixed
-        from torch.utils.data import ChainDataset
         half = args.num_train_examples // 2
         needle_ds = NeedleHaystackDataset(
             tokenizer=decoder.tokenizer,
@@ -734,7 +737,6 @@ def main():
         context_max_length=context_chunk_length,
         seed=args.seed + 2,
     )
-    from torch.utils.data import ChainDataset
     eval_dataset = ChainDataset([eval_needle, eval_lookup])
 
     # Create dataloaders (left-padding for decoder-only generation)
@@ -784,9 +786,11 @@ def main():
         "dataset": args.dataset,
         "gca_attn_dropout": args.gca_attn_dropout,
         "gca_output_dropout": args.gca_output_dropout,
-        "gca_layers": str(decoder.gca_layer_indices),
-        "gca_num_blocks": len(decoder.gca_layer_indices),
-        "curriculum": args.curriculum,
+        "hook_layers": str(decoder.gca_layer_indices),
+        "curriculum": not args.no_curriculum,
+        "pipeline_num_heads": args.pipeline_num_heads,
+        "pipeline_gap": args.pipeline_gap,
+        "pipeline_start_layer": args.pipeline_start_layer,
     }
 
     effective_batches_per_epoch = math.ceil(
@@ -811,6 +815,8 @@ def main():
         output_dir=str(output_dir),
         num_training_steps=total_training_steps,
         warmup_steps=args.warmup_steps,
+        routing_sparsity_weight=args.routing_sparsity_weight,
+        routing_balance_weight=args.routing_balance_weight,
     )
 
     if use_wandb:
@@ -891,8 +897,8 @@ def main():
     if args.unfreeze_after_step and args.unfreeze_after_step > 0:
         unfreeze_from = args.unfreeze_from_layer
         if unfreeze_from is None:
-            first_gca = min(decoder.gca_layer_indices)
-            unfreeze_from = max(0, first_gca - 2)
+            first_hook = min(decoder.gca_layer_indices)
+            unfreeze_from = max(0, first_hook - 2)
         trainer.configure_unfreeze(
             after_step=args.unfreeze_after_step,
             from_layer=unfreeze_from,

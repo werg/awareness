@@ -8,13 +8,12 @@ __version__ = "0.0.1"
 
 from awareness.config import Config
 from awareness.models.encoder import ContextEncoder
-from awareness.models.decoder import ReasoningDecoder, GatedCrossAttention
+from awareness.models.decoder import GatedCrossAttention
 from awareness.memory import LatentMemoryStore
 
 __all__ = [
     "Config",
     "ContextEncoder",
-    "ReasoningDecoder",
     "GatedCrossAttention",
     "LatentMemoryStore",
 ]

@@ -39,8 +39,17 @@ class DummyEncoder(nn.Module):
         self.hidden_size = hidden_size
         self.embedding = nn.Embedding(16, hidden_size)
 
-    def forward(self, input_ids, attention_mask=None, output_hidden_states=True):
+    def forward(self, input_ids, attention_mask=None, return_eos=False):
         hidden = self.embedding(input_ids)
+        if return_eos:
+            # Extract EOS (last real token per sequence)
+            if attention_mask is not None:
+                eos_pos = attention_mask.sum(dim=1).long() - 1
+            else:
+                eos_pos = torch.full((input_ids.size(0),), input_ids.size(1) - 1,
+                                     dtype=torch.long, device=input_ids.device)
+            eos_hidden = hidden[torch.arange(input_ids.size(0), device=input_ids.device), eos_pos]
+            return hidden, hidden, eos_hidden
         return hidden, hidden  # (K_mem, V_mem) matching ContextEncoder interface
 
     def get_trainable_parameters(self):
@@ -58,19 +67,18 @@ class DummyDecoder(nn.Module):
         self.gca_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
         self.tokenizer = SimpleNamespace(pad_token_id=0)
-        self.gca_blocks = nn.ModuleDict()
         self._hooks: List = []
+        self._last_doc_scores = None
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask=None,
-        memory_key=None,
-        memory_value=None,
-        memory_mask=None,
+        pipeline_memory=None,
         **_: Dict,
     ):
-        mem = (memory_key + memory_value) / 2
+        # Use token_key + token_value from pipeline memory
+        mem = (pipeline_memory["token_key"] + pipeline_memory["token_value"]) / 2
         mem = self.gca_proj(mem) * self.memory_scale
         seq_len = input_ids.size(1)
         mem = mem[:, :seq_len, :]
@@ -79,6 +87,12 @@ class DummyDecoder(nn.Module):
 
     def get_gate_values(self):
         return {"dummy": float(self.memory_scale)}
+
+    def get_all_gates(self):
+        return {}
+
+    def get_attention_blocks(self):
+        return []
 
     def get_trainable_parameters(self, include_base: bool = False):
         params = list(self.gca_proj.parameters()) + list(self.lm_head.parameters())
